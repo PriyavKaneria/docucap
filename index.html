@@ -1,198 +1,301 @@
 <!DOCTYPE html>
 <html>
-<head>
-    <title>Multi-Cam Stitching Control</title>
-    <style>
-        body { font-family: sans-serif; background-color: #f4f4f9; color: #333; }
-        h1, h2 { text-align: center; color: #444; }
-        .container { display: flex; justify-content: space-around; flex-wrap: wrap; }
-        .cam-view { border: 1px solid #ccc; padding: 10px; margin: 10px; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .controls { margin-bottom: 20px; text-align: center; }
-        fieldset { border: 1px solid #ddd; padding: 15px; margin: 20px auto; max-width: 800px; border-radius: 8px; }
-        legend { font-weight: bold; color: #555; padding: 0 10px; }
-        #final-view { text-align: center; margin-top: 20px; }
-        #final-image { max-width: 90%; border: 2px solid green; margin-top: 10px; }
-        button { padding: 10px 15px; font-size: 16px; margin: 5px; border-radius: 5px; border: none; color: white; cursor: pointer; }
-        #btn-calibrate, #btn-process, #btn-homography, #btn-capture, #btn-start-stream { background-color: #007bff; }
-        #btn-stop-stream { background-color: #dc3545; }
-        button:disabled { background-color: #6c757d; cursor: not-allowed; }
-        #status-message { font-weight: bold; color: #333; background-color: #e9ecef; padding: 10px; border-radius: 5px; display: inline-block; }
-    </style>
-</head>
-<body>
-    <h1>Multi-Cam Control System</h1>
+	<head>
+		<title>Multi-Cam Stitching Control</title>
+		<style>
+			body {
+				font-family: sans-serif;
+				background-color: #f4f4f9;
+				color: #333;
+			}
+			h1,
+			h2 {
+				text-align: center;
+				color: #444;
+			}
+			.container {
+				display: flex;
+				justify-content: space-around;
+				flex-wrap: wrap;
+			}
+			.cam-view {
+				border: 1px solid #ccc;
+				padding: 10px;
+				margin: 10px;
+				background-color: #fff;
+				border-radius: 8px;
+				box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+			}
+			.controls {
+				margin-bottom: 20px;
+				text-align: center;
+			}
+			fieldset {
+				border: 1px solid #ddd;
+				padding: 15px;
+				margin: 20px auto;
+				max-width: 800px;
+				border-radius: 8px;
+			}
+			legend {
+				font-weight: bold;
+				color: #555;
+				padding: 0 10px;
+			}
+			#final-view {
+				text-align: center;
+				margin-top: 20px;
+			}
+			#final-image {
+				max-width: 90%;
+				border: 2px solid green;
+				margin-top: 10px;
+			}
+			button {
+				padding: 10px 15px;
+				font-size: 16px;
+				margin: 5px;
+				border-radius: 5px;
+				border: none;
+				color: white;
+				cursor: pointer;
+			}
+			#btn-calibrate,
+			#btn-process,
+			#btn-homography,
+			#btn-capture,
+			#btn-start-stream {
+				background-color: #007bff;
+			}
+			#btn-stop-stream {
+				background-color: #dc3545;
+			}
+			button:disabled {
+				background-color: #6c757d;
+				cursor: not-allowed;
+			}
+			#status-message {
+				font-weight: bold;
+				color: #333;
+				background-color: #e9ecef;
+				padding: 10px;
+				border-radius: 5px;
+				display: inline-block;
+			}
+		</style>
+	</head>
+	<body>
+		<h1>Multi-Cam Control System</h1>
 
-    <div class="status controls">
-        Status: <span id="status-message">Idle. Connect to WebSocket to begin.</span>
-    </div>
+		<div class="status controls">
+			Status:
+			<span id="status-message">Idle. Connect to WebSocket to begin.</span>
+		</div>
 
-    <!-- NEW TEST SECTION -->
-    <fieldset>
-        <legend>Live Stream Test</legend>
-        <div class="controls">
-            <button id="btn-start-stream" onclick="startAllStreams()">Start Streams</button>
-            <button id="btn-stop-stream" onclick="stopAllStreams()">Stop Streams</button>
-        </div>
-    </fieldset>
+		<!-- NEW TEST SECTION -->
+		<fieldset>
+			<legend>Live Stream Test</legend>
+			<div class="controls">
+				<button id="btn-start-stream" onclick="startAllStreams()">
+					Start Streams
+				</button>
+				<button id="btn-stop-stream" onclick="stopAllStreams()">
+					Stop Streams
+				</button>
+			</div>
+		</fieldset>
 
-    <fieldset>
-        <legend>Stitching Pipeline Controls</legend>
-        <div id="main-controls" class="controls">
-            <p><strong>Step 1:</strong> Create panoramas for each camera.</p>
-            <button id="btn-calibrate" onclick="startCalibration()">Calibrate (Capture 30 Frames)</button>
-            <button id="btn-process" onclick="processCalibration()" disabled>Process Panoramas</button>
-            <hr>
-            <p><strong>Step 2:</strong> Align the three panoramas.</p>
-            <button id="btn-homography" onclick="calculateHomography()" disabled>Calculate Final Homography</button>
-            <hr>
-            <p><strong>Step 3:</strong> Capture a live, stitched frame.</p>
-            <button id="btn-capture" onclick="captureSingle()" disabled>Capture & Stitch Single Frame</button>
-        </div>
-    </fieldset>
-    
-    <div class="container">
-        <div class="cam-view">
-            <h2>ESP1</h2>
-            <p id="fps1">FPS: 0</p>
-            <canvas id="canvas1" width="320" height="240"></canvas>
-        </div>
-        <div class="cam-view">
-            <h2>ESP2</h2>
-            <p id="fps2">FPS: 0</p>
-            <canvas id="canvas2" width="320" height="240"></canvas>
-        </div>
-        <div class="cam-view">
-            <h2>ESP3</h2>
-            <p id="fps3">FPS: 0</p>
-            <canvas id="canvas3" width="320" height="240"></canvas>
-        </div>
-    </div>
-    
-    <div id="final-view">
-        <h2>Final Stitched Image</h2>
-        <img id="final-image" src="" alt="Final stitched output will appear here"/>
-    </div>
+		<fieldset>
+			<legend>Stitching Pipeline Controls</legend>
+			<div id="main-controls" class="controls">
+				<p><strong>Step 1:</strong> Create panoramas for each camera.</p>
+				<button id="btn-calibrate" onclick="startCalibration()">
+					Calibrate (Capture 30 Frames)
+				</button>
+				<button id="btn-process" onclick="processCalibration()" disabled>
+					Process Panoramas
+				</button>
+				<hr />
+				<p><strong>Step 2:</strong> Align the three panoramas.</p>
+				<button id="btn-homography" onclick="calculateHomography()">
+					Calculate Final Homography
+				</button>
+				<hr />
+				<p><strong>Step 3:</strong> Capture a live, stitched frame.</p>
+				<button id="btn-capture" onclick="captureSingle()" disabled>
+					Capture & Stitch Single Frame
+				</button>
+			</div>
+		</fieldset>
 
-    <script>
-        const wsBridge = new WebSocket("ws://127.0.0.1:8080/bridge");
+		<div class="container">
+			<div class="cam-view">
+				<h2>ESP1</h2>
+				<p id="fps1">FPS: 0</p>
+				<canvas id="canvas1" width="320" height="240"></canvas>
+			</div>
+			<div class="cam-view">
+				<h2>ESP2</h2>
+				<p id="fps2">FPS: 0</p>
+				<canvas id="canvas2" width="320" height="240"></canvas>
+			</div>
+			<div class="cam-view">
+				<h2>ESP3</h2>
+				<p id="fps3">FPS: 0</p>
+				<canvas id="canvas3" width="320" height="240"></canvas>
+			</div>
+		</div>
 
-        // UI Elements
-        const statusMessage = document.getElementById('status-message');
-        const btnCalibrate = document.getElementById('btn-calibrate');
-        const btnProcess = document.getElementById('btn-process');
-        const btnHomography = document.getElementById('btn-homography');
-        const btnCapture = document.getElementById('btn-capture');
-        const finalImage = document.getElementById('final-image');
+		<div id="final-view">
+			<h2>Final Stitched Image</h2>
+			<img
+				id="final-image"
+				src=""
+				alt="Final stitched output will appear here"
+			/>
+		</div>
 
-        // Canvas and Image elements
-        const canvases = {
-            '1': document.getElementById('canvas1').getContext('2d'),
-            '2': document.getElementById('canvas2').getContext('2d'),
-            '3': document.getElementById('canvas3').getContext('2d'),
-        };
-        const images = {
-            '1': new Image(), '2': new Image(), '3': new Image()
-        };
-        const fpsCounters = {
-            '1': 0, '2': 0, '3': 0
-        };
-        
-        let calibrationFramesReceived = { '1': false, '2': false, '3': false };
+		<script>
+			const wsBridge = new WebSocket("ws://127.0.0.1:8080/bridge")
 
-        // Setup image onload handlers
-        for (const id in images) {
-            images[id].onload = function() {
-                canvases[id].drawImage(images[id], 0, 0, 320, 240);
-                URL.revokeObjectURL(this.src);
-            }
-        }
+			// UI Elements
+			const statusMessage = document.getElementById("status-message")
+			const btnCalibrate = document.getElementById("btn-calibrate")
+			const btnProcess = document.getElementById("btn-process")
+			const btnHomography = document.getElementById("btn-homography")
+			const btnCapture = document.getElementById("btn-capture")
+			const finalImage = document.getElementById("final-image")
 
-        wsBridge.onopen = () => {
-            statusMessage.textContent = "Connected to server. Ready.";
-        };
+			// Canvas and Image elements
+			const canvases = {
+				1: document.getElementById("canvas1").getContext("2d"),
+				2: document.getElementById("canvas2").getContext("2d"),
+				3: document.getElementById("canvas3").getContext("2d"),
+			}
+			const images = {
+				1: new Image(),
+				2: new Image(),
+				3: new Image(),
+			}
+			const fpsCounters = {
+				1: 0,
+				2: 0,
+				3: 0,
+			}
 
-        wsBridge.onclose = () => {
-            statusMessage.textContent = "Disconnected from server.";
-        };
+			let calibrationFramesReceived = { 1: false, 2: false, 3: false }
 
-        wsBridge.onmessage = (event) => {
-            if (event.data instanceof Blob) {
-                handleImageData(event.data);
-            } else {
-                const msg = JSON.parse(event.data);
-                console.log("Received status:", msg);
-                handleStatusMessage(msg);
-            }
-        };
-        
-        function handleImageData(blob) {
-            const reader = new FileReader();
-            reader.onload = function() {
-                const espId = reader.result;
-                const imageBlob = blob.slice(1);
-                images[espId].src = URL.createObjectURL(imageBlob);
-                fpsCounters[espId]++;
-            };
-            reader.readAsText(blob.slice(0, 1));
-        }
+			// Setup image onload handlers
+			for (const id in images) {
+				images[id].onload = function () {
+					canvases[id].drawImage(images[id], 0, 0, 320, 240)
+					URL.revokeObjectURL(this.src)
+				}
+			}
 
-        function handleStatusMessage(msg) {
-            statusMessage.textContent = msg.status;
-            switch(msg.status) {
-                case "calibration_started":
-                    btnCalibrate.disabled = true;
-                    btnProcess.disabled = true;
-                    break;
-                case "calibration_capture_complete":
-                    calibrationFramesReceived[msg.esp_id] = true;
-                    if (Object.values(calibrationFramesReceived).every(v => v)) {
-                        statusMessage.textContent = "Calibration data received. Ready to process.";
-                        btnProcess.disabled = false;
-                    }
-                    break;
-                case "processing_complete":
-                     statusMessage.textContent = "Panorama processing complete. Ready for homography.";
-                     btnHomography.disabled = false;
-                     break;
-                case "homography_complete":
-                    statusMessage.textContent = "Homography calculated. Ready for live capture.";
-                    btnCapture.disabled = false;
-                    break;
-                case "capture_stitch_complete":
-                    statusMessage.textContent = "Live frame stitched successfully!";
-                    // You could display the final image here if the server sent a path
-                    // e.g., finalImage.src = msg.stitched_image_path; (would require server to expose the data dir)
-                    break;
-            }
-        }
+			wsBridge.onopen = () => {
+				statusMessage.textContent = "Connected to server. Ready."
+			}
 
-        function sendCommand(command) {
-            console.log("Sending command:", command);
-            if (wsBridge.readyState === WebSocket.OPEN) {
-                wsBridge.send(JSON.stringify({ command: command }));
-            } else {
-                console.error("WebSocket is not open. Cannot send command.");
-                statusMessage.textContent = "Error: WebSocket disconnected.";
-            }
-        }
+			wsBridge.onclose = () => {
+				statusMessage.textContent = "Disconnected from server."
+			}
 
-        // --- NEW Functions for Test Buttons ---
-        function startAllStreams() { sendCommand("start_all_streams"); }
-        function stopAllStreams() { sendCommand("stop_all_streams"); }
-        
-        // --- Existing Functions for Stitching Pipeline ---
-        function startCalibration() { sendCommand("calibrate"); }
-        function processCalibration() { sendCommand("process_calibration"); }
-        function calculateHomography() { sendCommand("calculate_homography"); }
-        function captureSingle() { sendCommand("capture_single"); }
+			wsBridge.onmessage = (event) => {
+				if (event.data instanceof Blob) {
+					handleImageData(event.data)
+				} else {
+					const msg = JSON.parse(event.data)
+					console.log("Received status:", msg)
+					handleStatusMessage(msg)
+				}
+			}
 
-        // FPS counter
-        setInterval(() => {
-            for (const id in fpsCounters) {
-                document.getElementById(`fps${id}`).innerText = `FPS: ${fpsCounters[id]}`;
-                fpsCounters[id] = 0;
-            }
-        }, 1000);
-    </script>
-</body>
+			function handleImageData(blob) {
+				const reader = new FileReader()
+				reader.onload = function () {
+					const espId = reader.result
+					const imageBlob = blob.slice(1)
+					images[espId].src = URL.createObjectURL(imageBlob)
+					fpsCounters[espId]++
+				}
+				reader.readAsText(blob.slice(0, 1))
+			}
+
+			function handleStatusMessage(msg) {
+				statusMessage.textContent = msg.status
+				switch (msg.status) {
+					case "calibration_started":
+						btnCalibrate.disabled = true
+						btnProcess.disabled = true
+						break
+					case "calibration_capture_complete":
+						calibrationFramesReceived[msg.esp_id] = true
+						if (Object.values(calibrationFramesReceived).every((v) => v)) {
+							statusMessage.textContent =
+								"Calibration data received. Ready to process."
+							btnProcess.disabled = false
+						}
+						break
+					case "processing_complete":
+						statusMessage.textContent =
+							"Panorama processing complete. Ready for homography."
+						btnHomography.disabled = false
+						break
+					case "homography_complete":
+						statusMessage.textContent =
+							"Homography calculated. Ready for live capture."
+						btnCapture.disabled = false
+						break
+					case "capture_stitch_complete":
+						statusMessage.textContent = "Live frame stitched successfully!"
+						// You could display the final image here if the server sent a path
+						// e.g., finalImage.src = msg.stitched_image_path; (would require server to expose the data dir)
+						break
+				}
+			}
+
+			function sendCommand(command) {
+				console.log("Sending command:", command)
+				if (wsBridge.readyState === WebSocket.OPEN) {
+					wsBridge.send(JSON.stringify({ command: command }))
+				} else {
+					console.error("WebSocket is not open. Cannot send command.")
+					statusMessage.textContent = "Error: WebSocket disconnected."
+				}
+			}
+
+			// --- NEW Functions for Test Buttons ---
+			function startAllStreams() {
+				sendCommand("start_all_streams")
+			}
+			function stopAllStreams() {
+				sendCommand("stop_all_streams")
+			}
+
+			// --- Existing Functions for Stitching Pipeline ---
+			function startCalibration() {
+				sendCommand("calibrate")
+			}
+			function processCalibration() {
+				sendCommand("process_calibration")
+			}
+			function calculateHomography() {
+				sendCommand("calculate_homography")
+			}
+			function captureSingle() {
+				sendCommand("capture_single")
+			}
+
+			// FPS counter
+			setInterval(() => {
+				for (const id in fpsCounters) {
+					document.getElementById(
+						`fps${id}`
+					).innerText = `FPS: ${fpsCounters[id]}`
+					fpsCounters[id] = 0
+				}
+			}, 1000)
+		</script>
+	</body>
 </html>

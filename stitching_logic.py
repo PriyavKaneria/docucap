@@ -12,20 +12,52 @@ import multiprocessing as mp
 #  preventing error accumulation and producing a sharp result.
 # ==============================================================================
 
+def is_homography_sane(H, src_shape, max_stretch=2.0, max_shrink=0.5):
+    """
+    Validates a homography matrix to ensure it's not producing an
+    extreme, nonsensical transformation.
+    """
+    if H is None:
+        return False
+
+    # Check for non-invertibility, which indicates a degenerate matrix
+    if abs(np.linalg.det(H)) < 1e-7:
+        print("Warning: Degenerate homography found (determinant is near zero).")
+        return False
+
+    # Warp the corners of the source image
+    h, w = src_shape[:2]
+    corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
+    warped_corners = cv2.perspectiveTransform(corners, H)
+
+    # Calculate the area of the warped quadrilateral
+    # Using the Shoelace formula for the area of a polygon
+    x = warped_corners[:, 0, 0]
+    y = warped_corners[:, 0, 1]
+    area = 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+    
+    original_area = h * w
+    
+    # Check if the area has changed drastically
+    if not (original_area * max_shrink < area < original_area * max_stretch):
+        print(f"Warning: Insane homography found (area changed from {original_area} to {area:.0f}).")
+        return False
+        
+    return True
+
 class RobustStitcher:
     def __init__(self):
         self.finder = cv2.SIFT_create()
 
     def stitch(self, images):
         """
-        Performs a robust, high-quality stitch using a central anchor and global alignment.
+        Final robust version. Includes a sanity check for every calculated
+        homography to discard extreme distortions.
         """
-        if len(images) < 2:
-            return images[0] if images else None
-
+        if len(images) < 2: return images[0] if images else None
         print("Starting robust global alignment stitching pipeline...")
 
-        # 1. Feature Detection for all images
+        # 1. Feature Detection
         print("Step 1: Detecting features...")
         keypoints, descriptors = [], []
         for img in images:
@@ -34,99 +66,86 @@ class RobustStitcher:
             keypoints.append(kp)
             descriptors.append(des)
 
-         # 2. More Robust Feature Matching (FLANN + Lowe's Ratio Test)
+        # 2. Robust Feature Matching
         print("Step 2: Matching all pairs with robust filtering...")
-        
-        # FLANN parameters for SIFT
         FLANN_INDEX_KDTREE = 1
         index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
         search_params = dict(checks=50)
-        
-        # Create the FLANN matcher
         flann = cv2.FlannBasedMatcher(index_params, search_params)
-        
         all_matches = {}
         for i in range(len(images)):
             for j in range(i + 1, len(images)):
                 des1, des2 = descriptors[i], descriptors[j]
-                
-                # Ensure descriptors are valid and of type float32 for FLANN
-                if (des1 is None or des2 is None or
-                    des1.shape[0] < 2 or des2.shape[0] < 2):
-                    continue
-
-                # knnMatch expects float32 descriptors
+                if des1 is None or des2 is None or des1.shape[0] < 2 or des2.shape[0] < 2: continue
                 raw_matches = flann.knnMatch(des1.astype(np.float32), des2.astype(np.float32), k=2)
-
-                # Apply Lowe's Ratio Test to filter out ambiguous matches
-                good_matches = []
-                for m, n in raw_matches:
-                    if m.distance < 0.7 * n.distance:
-                        good_matches.append(m)
-
-                if len(good_matches) > 20:
-                    all_matches[(i, j)] = good_matches
+                good_matches = [m for m, n in raw_matches if m.distance < 0.7 * n.distance]
+                if len(good_matches) > 20: all_matches[(i, j)] = good_matches
 
         if not all_matches:
-            print("Error: Not enough good matches found between any image pairs. Try better source images.")
+            print("Error: Not enough good matches found.")
             return None
 
-        # 3. Select the best anchor image (the one with the most strong links)
+        # 3. Select Anchor Image
         print("Step 3: Selecting anchor image...")
-        inlier_counts = {}
-        for i in range(len(images)):
-            inlier_counts[i] = sum(1 for (im1, im2) in all_matches if im1 == i or im2 == i)
-        
+        inlier_counts = {i: sum(1 for (im1, im2) in all_matches if im1 == i or im2 == i) for i in range(len(images))}
+        if not inlier_counts:
+            print("Error: Could not establish any connections between images.")
+            return None
         anchor_idx = max(inlier_counts, key=inlier_counts.get)
         print(f"Selected image {anchor_idx} as the anchor.")
         
-        # 4. Compute all homographies relative to the anchor image
-        print("Step 4: Calculating all homographies relative to the anchor...")
-        final_homographies = [np.eye(3) for _ in range(len(images))]
+        # 4. Compute and VALIDATE all homographies
+        print("Step 4: Calculating and validating all homographies relative to the anchor...")
+        final_homographies = [np.eye(3, dtype=np.float32) for _ in range(len(images))]
 
         for i in range(len(images)):
-            if i == anchor_idx:
-                continue
-
-            # We must correctly identify which image was the query and which was the train.
+            if i == anchor_idx: continue
             pair = (min(i, anchor_idx), max(i, anchor_idx))
             matches = all_matches.get(pair, [])
-            if len(matches) < 4:
-                continue
+            if len(matches) < 4: continue
 
-            # Keypoints for the current image `i` and the anchor image
-            kp_i = keypoints[i]
-            kp_anchor = keypoints[anchor_idx]
+            kp_i, kp_anchor = keypoints[i], keypoints[anchor_idx]
             
-            # We need to map `kp_i` (src) to `kp_anchor` (dst).
-            # We check which image was the query (first in pair) and which was train (second).
-            if pair[0] == i and pair[1] == anchor_idx:
-                # Case 1: i was query, anchor was train
+            if pair[0] == i:
                 src_pts = np.float32([kp_i[m.queryIdx].pt for m in matches])
                 dst_pts = np.float32([kp_anchor[m.trainIdx].pt for m in matches])
-            elif pair[0] == anchor_idx and pair[1] == i:
-                # Case 2: anchor was query, i was train. We must swap the indices.
+            else:
                 src_pts = np.float32([kp_i[m.trainIdx].pt for m in matches])
                 dst_pts = np.float32([kp_anchor[m.queryIdx].pt for m in matches])
-            else:
-                # This case should not be reached, but as a safeguard:
-                continue
             
-            H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-            if H is not None:
+            # --- THE FIX IS HERE ---
+            # Use a tighter RANSAC threshold and validate the result.
+            H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 3.0) # Tighter threshold
+            
+            if is_homography_sane(H, images[i].shape):
                 final_homographies[i] = H
+            else:
+                # If not sane, we keep the identity matrix, effectively unlinking this image
+                print(f"Discarding insane homography for image {i}.")
+        # --- END OF FIX ---
 
-        # 5. Iteratively warp and blend onto a final canvas
-        print("Step 5: Warping all images once and blending...")
-        
-        # Calculate final canvas size
+        # 5. Warping and Blending
+        print("Step 5: Warping all images and blending...")
         h, w = images[anchor_idx].shape[:2]
         corners = np.float32([[0,0], [0,h], [w,h], [w,0]]).reshape(-1,1,2)
         all_corners = []
+        
+        valid_indices = [] # Keep track of images with sane homographies
         for i in range(len(images)):
-            H_inv = np.linalg.inv(final_homographies[i])
-            warped_corners = cv2.perspectiveTransform(corners, H_inv)
-            all_corners.append(warped_corners)
+            try:
+                # Only consider images that have a non-identity (i.e., calculated) homography
+                if np.array_equal(final_homographies[i], np.eye(3)) and i != anchor_idx:
+                    continue
+                H_inv = np.linalg.inv(final_homographies[i])
+                warped_corners = cv2.perspectiveTransform(corners, H_inv)
+                all_corners.append(warped_corners)
+                valid_indices.append(i) # This image is good to use
+            except np.linalg.LinAlgError:
+                continue
+                
+        if len(valid_indices) < 2:
+            print("Error: Not enough valid homographies to create a panorama.")
+            return None
             
         all_corners = np.concatenate(all_corners, axis=0)
         [x_min, y_min] = np.int32(all_corners.min(axis=0).ravel() - 0.5)
@@ -135,49 +154,34 @@ class RobustStitcher:
         canvas_size = (x_max - x_min, y_max - y_min)
         H_translation = np.array([[1, 0, -x_min], [0, 1, -y_min], [0, 0, 1]], dtype=np.float32)
 
-        # Initialize final panorama and weight map for blending
         panorama = np.zeros((canvas_size[1], canvas_size[0], 3), np.float32)
         weight_map = np.zeros((canvas_size[1], canvas_size[0]), np.float32)
-
-        # This combined mask will track all non-black pixels
         combined_mask = np.zeros((canvas_size[1], canvas_size[0]), np.uint8)
 
-        for i, img in enumerate(images):
+        # Only loop through images that had a valid homography
+        for i in valid_indices:
+            img = images[i]
             H_final = H_translation.dot(final_homographies[i])
             warped_img = cv2.warpPerspective(img, H_final, canvas_size)
-            
             h_img, w_img = img.shape[:2]
             mask = np.ones((h_img, w_img), dtype=np.uint8) * 255
             warped_mask = cv2.warpPerspective(mask, H_final, canvas_size)
-            
             feather_mask = cv2.distanceTransform(warped_mask, cv2.DIST_L2, 5).astype(np.float32)
-
             for c in range(3):
                 panorama[:, :, c] += warped_img[:, :, c] * feather_mask
             weight_map += feather_mask
-            
-            # Add the warped mask to our combined mask
             combined_mask = cv2.bitwise_or(combined_mask, warped_mask)
         
         normalized_panorama = cv2.divide(panorama, cv2.merge([weight_map, weight_map, weight_map]) + 1e-7)
         normalized_panorama = normalized_panorama.astype(np.uint8)
 
-        # 6. Find the tightest bounding box around the content and crop
+        # 6. Content-aware cropping
         print("Step 6: Cropping black borders...")
-        
-        # Find contours of the non-black regions
         contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
-            print("Warning: No content found to crop. Returning uncropped image.")
-            return normalized_panorama
-            
-        # Find the bounding box that encloses all contours
+        if not contours: return normalized_panorama
         x_min_crop, y_min_crop, w_crop, h_crop = cv2.boundingRect(np.concatenate(contours))
-        
-        # Crop the panorama to this bounding box
         final_image = normalized_panorama[y_min_crop:y_min_crop+h_crop, x_min_crop:x_min_crop+w_crop]
-        
+
         print("Stitching complete.")
         return final_image
     
@@ -321,4 +325,7 @@ def compute_homographies_fast(keypoints_list, matches_list):
     return homographies
 
 if __name__ == "__main__":
-    stitch_calibration_images(1)
+    # stitch_calibration_images(1)
+    # stitch_calibration_images(2)
+    # stitch_calibration_images(3)
+    pass
