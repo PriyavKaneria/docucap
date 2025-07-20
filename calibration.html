@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<title>ESP32 Camera Stream</title>
+		<script>
+			let ws1Connected = true
+			let ws2Connected = true
+			let ws3Connected = true
+			let fps1 = 0,
+				fps2 = 0,
+				fps3 = 0
+			let lastCaptureTime = 0
+			var canvas1, canvas2, canvas3
+			var ctx1, ctx2, ctx3
+			var img1, img2, img3
+			let continueInterval
+			let fpsInterval = setInterval(() => {
+				document.getElementById("fps1").innerText = "FPS: " + fps1
+				document.getElementById("fps2").innerText = "FPS: " + fps2
+				document.getElementById("fps3").innerText = "FPS: " + fps3
+				fps1 = 0
+				fps2 = 0
+				fps3 = 0
+				// release locks in case it hangs while capturing
+				if (continueInterval) {
+					ws1Lock = false
+					ws2Lock = false
+					ws3Lock = false
+				}
+			}, 1000)
+
+			try {
+				var ws1 = new WebSocket("ws://192.168.137.19/ws")
+			} catch (error) {
+				ws1Connected = false
+			}
+			try {
+				var ws2 = new WebSocket("ws://192.168.137.149/ws")
+			} catch (error) {
+				ws2Connected = false
+			}
+			try {
+				var ws3 = new WebSocket("ws://192.168.137.90/ws")
+			} catch (error) {
+				ws3Connected = false
+			}
+			setTimeout(register, 1000)
+			var wsBridge = new WebSocket("ws://127.0.0.1:8080/bridge")
+			setTimeout(() => {
+				wsBridge.send("ping")
+			}, 1000)
+
+			wsBridge.onmessage = function (event) {
+				// get port number event data which ends with "#{portnumber}"
+				// event data is in binary format
+				var msg = event.data
+				var reader = new FileReader()
+				reader.onload = function () {
+					var port = parseInt(reader.result)
+					// remove first byte from msg
+					msg = msg.slice(1, msg.length)
+					// console.log(port)
+
+					if (port == 1) {
+						img1.src = URL.createObjectURL(msg)
+						fps1++
+						ws1Lock = false
+					} else if (port == 2) {
+						img2.src = URL.createObjectURL(msg)
+						fps2++
+						ws2Lock = false
+					} else if (port == 3) {
+						img3.src = URL.createObjectURL(msg)
+						fps3++
+						ws3Lock = false
+					}
+				}
+				reader.readAsText(msg.slice(0, 1))
+			}
+
+			function register() {
+				if (ws1Connected) {
+					try {
+						ws1.send("laptop")
+					} catch (error) {
+						// console.log(error)
+						ws1Connected = false
+					}
+				}
+				if (ws2Connected) {
+					try {
+						ws2.send("laptop")
+					} catch (error) {
+						// console.log(error)
+						ws2Connected = false
+					}
+				}
+				if (ws3Connected) {
+					try {
+						ws3.send("laptop")
+					} catch (error) {
+						// console.log(error)
+						ws3Connected = false
+					}
+				}
+				canvas1 = document.getElementById("canvas1")
+				ctx1 = canvas1.getContext("2d")
+				canvas2 = document.getElementById("canvas2")
+				ctx2 = canvas2.getContext("2d")
+				canvas3 = document.getElementById("canvas3")
+				ctx3 = canvas3.getContext("2d")
+				img1 = new Image()
+				img2 = new Image()
+				img3 = new Image()
+				img1.onload = function () {
+					ctx1.drawImage(img1, 0, 0, canvas1.width, canvas1.height)
+				}
+				img2.onload = function () {
+					ctx2.drawImage(img2, 0, 0, canvas2.width, canvas2.height)
+				}
+				img3.onload = function () {
+					ctx3.drawImage(img3, 0, 0, canvas3.width, canvas3.height)
+				}
+			}
+
+			let ws1Lock = false
+			let ws2Lock = false
+			let ws3Lock = false
+			function capture() {
+				if (ws1Connected && !ws1Lock) {
+					try {
+						ws1.send("capture")
+						ws1Lock = true
+					} catch (error) {
+						console.log(error)
+					}
+				}
+				if (ws2Connected && !ws2Lock) {
+					try {
+						ws2.send("capture")
+						ws2Lock = true
+					} catch (error) {
+						console.log(error)
+					}
+				}
+				if (ws3Connected && !ws3Lock) {
+					try {
+						ws3.send("capture")
+						ws3Lock = true
+					} catch (error) {
+						console.log(error)
+					}
+				}
+			}
+
+			function startCapturing() {
+				if (continueInterval) {
+					clearInterval(continueInterval)
+				}
+				capture()
+				continueInterval = setInterval(() => {
+					if (ws1Connected) {
+						try {
+							ws1.send("continue")
+						} catch (error) {
+							console.log(error)
+						}
+					}
+					if (ws2Connected) {
+						try {
+							ws2.send("continue")
+						} catch (error) {
+							console.log(error)
+						}
+					}
+					if (ws3Connected) {
+						try {
+							ws3.send("continue")
+						} catch (error) {
+							console.log(error)
+						}
+					}
+				}, 3000)
+			}
+
+			function stopCapturing() {
+				if (continueInterval) {
+					clearInterval(continueInterval)
+					continueInterval = null
+				}
+				if (ws1Connected) {
+					try {
+						ws1.send("stop")
+					} catch (error) {
+						console.log(error)
+					}
+				}
+				if (ws2Connected) {
+					try {
+						ws2.send("stop")
+					} catch (error) {
+						console.log(error)
+					}
+				}
+				if (ws3Connected) {
+					try {
+						ws3.send("stop")
+					} catch (error) {
+						console.log(error)
+					}
+				}
+			}
+
+			async function capturePanorama() {
+				try {
+					// Disable button during capture
+					document.getElementById("capture-panorama-btn").disabled = true
+					document.getElementById("capture-panorama-btn").textContent = "Capturing..."
+
+					// Start capture
+					startCapturing()
+
+					// Wait a moment for capture to complete
+					await new Promise((resolve) => setTimeout(resolve, 10000))
+
+					// Stop capture
+					stopCapturing()
+
+					// Fetch captured frames
+					const response = await fetch("/get-frames")
+					const frames = await response.json()
+
+					// Create zip files for each ESP
+					const zip1 = new JSZip()
+					const zip2 = new JSZip()
+					const zip3 = new JSZip()
+
+					frames.forEach((frame, index) => {
+						if (index % 3 === 0) {
+							zip1.file(`frame${index}.jpg`, frame, { base64: true })
+						} else if (index % 3 === 1) {
+							zip2.file(`frame${index}.jpg`, frame, { base64: true })
+						} else {
+							zip3.file(`frame${index}.jpg`, frame, { base64: true })
+						}
+					})
+
+					// Download zip files
+					zip1.generateAsync({ type: "blob" }).then((content) => {
+						saveAs(content, "esp1_panorama.zip")
+					})
+					zip2.generateAsync({ type: "blob" }).then((content) => {
+						saveAs(content, "esp2_panorama.zip")
+					})
+					zip3.generateAsync({ type: "blob" }).then((content) => {
+						saveAs(content, "esp3_panorama.zip")
+					})
+
+					// Re-enable button
+					document.getElementById("capture-panorama-btn").disabled = false
+					document.getElementById("capture-panorama-btn").textContent = "Capture Panorama"
+				} catch (error) {
+					console.error("Capture failed:", error)
+					document.getElementById("capture-panorama-btn").disabled = false
+					document.getElementById("capture-panorama-btn").textContent = "Capture Panorama"
+				}
+			}
+
+			async function captureSingleFrame() {
+				try {
+					// Disable button during capture
+					document.getElementById("capture-single-frame-btn").disabled = true
+					document.getElementById("capture-single-frame-btn").textContent = "Capturing..."
+
+					// Capture single frame
+					capture()
+
+					// Wait a moment for capture to complete
+					await new Promise((resolve) => setTimeout(resolve, 3000))
+
+					// Fetch captured frames
+					const response = await fetch("/get-frames")
+					const frames = await response.json()
+
+					// Create zip files for each ESP
+					const zip1 = new JSZip()
+					const zip2 = new JSZip()
+					const zip3 = new JSZip()
+
+					frames.forEach((frame, index) => {
+						if (index % 3 === 0) {
+							zip1.file(`frame${index}.jpg`, frame, { base64: true })
+						} else if (index % 3 === 1) {
+							zip2.file(`frame${index}.jpg`, frame, { base64: true })
+						} else {
+							zip3.file(`frame${index}.jpg`, frame, { base64: true })
+						}
+					})
+
+					// Download zip files
+					zip1.generateAsync({ type: "blob" }).then((content) => {
+						saveAs(content, "esp1_single_frame.zip")
+					})
+					zip2.generateAsync({ type: "blob" }).then((content) => {
+						saveAs(content, "esp2_single_frame.zip")
+					})
+					zip3.generateAsync({ type: "blob" }).then((content) => {
+						saveAs(content, "esp3_single_frame.zip")
+					})
+
+					// Re-enable button
+					document.getElementById("capture-single-frame-btn").disabled = false
+					document.getElementById("capture-single-frame-btn").textContent = "Capture Single Frame"
+				} catch (error) {
+					console.error("Capture failed:", error)
+					document.getElementById("capture-single-frame-btn").disabled = false
+					document.getElementById("capture-single-frame-btn").textContent = "Capture Single Frame"
+				}
+			}
+		</script>
+		<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js"></script>
+		<script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+	</head>
+	<body>
+		<h1>ESP32 Camera Stream</h1>
+		<button onclick="startCapturing()">Start Capture</button>
+		<button onclick="stopCapturing()">Stop Capture</button>
+		<button id="capture-panorama-btn" onclick="capturePanorama()">Capture Panorama</button>
+		<button id="capture-single-frame-btn" onclick="captureSingleFrame()">Capture Single Frame</button>
+		<img id="image" />
+		<div style="display: flex; justify-content: space-around">
+			<div>
+				<h2>ESP1</h2>
+				<p id="fps1">FPS: 0</p>
+				<canvas id="canvas1" width="320" height="240"></canvas>
+			</div>
+			<div>
+				<h2>ESP2</h2>
+				<p id="fps2">FPS: 0</p>
+				<canvas id="canvas2" width="320" height="240"></canvas>
+			</div>
+			<div>
+				<h2>ESP3</h2>
+				<p id="fps3">FPS: 0</p>
+				<canvas id="canvas3" width="320" height="240"></canvas>
+			</div>
+		</div>
+	</body>
+</html>
