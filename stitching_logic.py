@@ -12,7 +12,7 @@ import multiprocessing as mp
 #  preventing error accumulation and producing a sharp result.
 # ==============================================================================
 
-def is_homography_sane(H, src_shape, max_stretch=2.0, max_shrink=0.5):
+def is_homography_sane(H, src_shape, max_stretch=2.0, max_shrink=0.5, max_perspective=0.002):
     """
     Validates a homography matrix to ensure it's not producing an
     extreme, nonsensical transformation.
@@ -20,34 +20,40 @@ def is_homography_sane(H, src_shape, max_stretch=2.0, max_shrink=0.5):
     if H is None:
         return False
 
-    # Check for non-invertibility, which indicates a degenerate matrix
     if abs(np.linalg.det(H)) < 1e-7:
         print("Warning: Degenerate homography found (determinant is near zero).")
         return False
 
-    # Warp the corners of the source image
+    # Check for extreme perspective distortion (the bottom row of the matrix)
+    if np.any(np.abs(H[2, :2]) > max_perspective):
+        print(f"Warning: Insane homography found (perspective value > {max_perspective}).")
+        return False
+
     h, w = src_shape[:2]
     corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
     warped_corners = cv2.perspectiveTransform(corners, H)
 
-    # Calculate the area of the warped quadrilateral
-    # Using the Shoelace formula for the area of a polygon
     x = warped_corners[:, 0, 0]
     y = warped_corners[:, 0, 1]
     area = 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
     
-    original_area = h * w
+    original_area = float(h * w)
     
-    # Check if the area has changed drastically
     if not (original_area * max_shrink < area < original_area * max_stretch):
-        print(f"Warning: Insane homography found (area changed from {original_area} to {area:.0f}).")
+        print(f"Warning: Insane homography found (area changed from {original_area} to {area:.0f}). Stretch/shrink limits exceeded.")
         return False
         
     return True
 
 class RobustStitcher:
-    def __init__(self):
+    # The stitcher is now fully configurable for different scenarios.
+    def __init__(self, match_confidence=0.7, ransac_thresh=3.0, sanity_max_stretch=2.0, sanity_max_shrink=0.5, sanity_max_perspective=0.002):
         self.finder = cv2.SIFT_create()
+        self.match_confidence = match_confidence
+        self.ransac_thresh = ransac_thresh
+        self.sanity_max_stretch = sanity_max_stretch
+        self.sanity_max_shrink = sanity_max_shrink
+        self.sanity_max_perspective = sanity_max_perspective
 
     def stitch(self, images):
         """
@@ -78,7 +84,13 @@ class RobustStitcher:
                 des1, des2 = descriptors[i], descriptors[j]
                 if des1 is None or des2 is None or des1.shape[0] < 2 or des2.shape[0] < 2: continue
                 raw_matches = flann.knnMatch(des1.astype(np.float32), des2.astype(np.float32), k=2)
-                good_matches = [m for m, n in raw_matches if m.distance < 0.7 * n.distance]
+                # Use the configurable confidence for Lowe's Ratio Test.
+                good_matches = []
+                # Add a check to prevent errors if a pair has < 2 raw matches
+                if len(raw_matches) > 1:
+                    for m, n in raw_matches:
+                        if m.distance < self.match_confidence * n.distance:
+                            good_matches.append(m)
                 if len(good_matches) > 20: all_matches[(i, j)] = good_matches
 
         if not all_matches:
@@ -113,16 +125,17 @@ class RobustStitcher:
                 src_pts = np.float32([kp_i[m.trainIdx].pt for m in matches])
                 dst_pts = np.float32([kp_anchor[m.queryIdx].pt for m in matches])
             
-            # --- THE FIX IS HERE ---
-            # Use a tighter RANSAC threshold and validate the result.
-            H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 3.0) # Tighter threshold
+            # Use the configurable RANSAC threshold.
+            H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, self.ransac_thresh)
             
-            if is_homography_sane(H, images[i].shape):
+            # Use the configurable sanity check parameters.
+            if is_homography_sane(H, images[i].shape,
+                                  max_stretch=self.sanity_max_stretch,
+                                  max_shrink=self.sanity_max_shrink,
+                                  max_perspective=self.sanity_max_perspective):
                 final_homographies[i] = H
             else:
-                # If not sane, we keep the identity matrix, effectively unlinking this image
                 print(f"Discarding insane homography for image {i}.")
-        # --- END OF FIX ---
 
         # 5. Warping and Blending
         print("Step 5: Warping all images and blending...")
@@ -192,7 +205,7 @@ class RobustStitcher:
 
 def stitch_calibration_images(esp_id):
     """
-    Reads calibration images and uses the new robust, global alignment stitcher.
+    Reads calibration images and uses the STITCHER IN STRICT MODE.
     """
     print(f"Starting ROBUST panorama stitching for ESP {esp_id}...")
     image_dir = f"data/calibration/esp{esp_id}/"
@@ -209,7 +222,14 @@ def stitch_calibration_images(esp_id):
         print("No valid images found.")
         return None
         
-    stitcher = RobustStitcher()
+    # Use the stitcher with a strict confidence for the dense calibration images.
+    stitcher = RobustStitcher(
+        match_confidence=0.7,
+        ransac_thresh=3.0,
+        sanity_max_stretch=2.0,
+        sanity_max_shrink=0.5,
+        sanity_max_perspective=0.002
+    )
     panorama = stitcher.stitch(images)
     
     if panorama is not None:
@@ -223,7 +243,7 @@ def stitch_calibration_images(esp_id):
 
 def calculate_homography_and_stitch(panorama_paths):
     """
-    Stitches the three main panoramas and saves simple homographies for live view.
+    Stitches the three main panoramas using the STITCHER IN RELAXED MODE.
     """
     print(f"Stitching final panoramas from: {panorama_paths}")
     images = [cv2.imread(p) for p in panorama_paths]
@@ -231,8 +251,15 @@ def calculate_homography_and_stitch(panorama_paths):
         print("Error: Could not load all panoramic images.")
         return None, None
 
-    # High-quality stitch for the final result
-    stitcher = RobustStitcher()
+    # High-quality stitch for the final result using MORE RELAXED settings.
+    # This allows for greater perspective and scale changes between the large panoramas.
+    stitcher = RobustStitcher(
+        match_confidence=0.85,      # More lenient matching
+        ransac_thresh=5.0,          # More tolerant of error
+        sanity_max_stretch=5.0,     # Allow area to grow up to 5x
+        sanity_max_shrink=0.2,      # Allow area to shrink down to 20%
+        sanity_max_perspective=0.008 # Allow more perspective distortion
+    )
     final_stitch = stitcher.stitch(images)
     final_image_path = None
     if final_stitch is not None:

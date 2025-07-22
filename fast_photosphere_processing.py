@@ -384,7 +384,7 @@ def benchmark_performance(images, iterations=5):
 # Main execution
 if __name__ == "__main__":
     # Load images
-    images = [cv2.imread(f"image{i}.jpg") for i in range(1,4)]
+    images = [cv2.imread(f"data\stitched_panoramas\esp{i}_panorama.jpg") for i in range(1,4)]
     
     if any(img is None for img in images):
         print("❌ Error: Could not load all images. Please check file paths.")

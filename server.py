@@ -9,9 +9,9 @@ import stitching_logic
 
 # --- Configuration ---
 ESP_IPS = {
-    '1': '192.168.137.84',  # esp32-257AC8
-    '2': '192.168.137.80',  # esp32-24F7DC
-    '3': '192.168.137.76', # esp32-255950 
+    '1': '192.168.137.239',  # esp32-257AC8
+    '2': '192.168.137.74',  # esp32-24F7DC
+    '3': '192.168.137.16', # esp32-255950 
 }
 ESP_WS_URL = "ws://{ip}/ws"
 CALIBRATION_FRAME_COUNT = 15 # Set desired number of frames here
@@ -22,7 +22,8 @@ esp_websockets = {}
 is_calibrating = False
 # --- NEW: State for single frame capture ---
 single_capture_frames = {}
-single_capture_event = asyncio.Event()
+# Create a dictionary to hold our shared state, including asyncio primitives
+shared_state = {}
 
 
 # --- WebSocket and UDP Handling (Modified) ---
@@ -109,9 +110,10 @@ async def broadcast_image_to_web(image_data):
             print(f"Failed to send image to client: {e}")
 
 class UDPHandler(asyncio.DatagramProtocol):
-    def __init__(self, port):
+    def __init__(self, port, shared_state):
         super().__init__()
         self.buffer = b""
+        self.shared_state = shared_state # Store the shared state
         self.port = port
         self.timeout_task = None
         self.calibration_frame_count = 0
@@ -145,9 +147,11 @@ class UDPHandler(asyncio.DatagramProtocol):
                         f.write(image_data)
                     single_capture_frames[esp_id] = filename
                     print(f"Saved single capture for ESP {esp_id}")
-                    self.is_capturing_single = False # Reset after one frame
+                    self.is_capturing_single = False
+                    
                     if len(single_capture_frames) == len(ESP_IPS):
-                        single_capture_event.set() # Notify the waiting task
+                        # Use the event from the shared state dictionary
+                        self.shared_state['single_capture_event'].set()
 
                 elif is_calibrating and self.calibration_frame_count < CALIBRATION_FRAME_COUNT:
                     self.calibration_frame_count += 1
@@ -231,12 +235,15 @@ async def handle_calculate_homography():
 
 # --- NEW: Single Capture Handler ---
 async def handle_capture_single():
-    global single_capture_frames, single_capture_event
+    # This function now correctly accesses the global shared_state
+    global single_capture_frames 
     print("Starting single frame capture...")
     
-    # Reset state
     single_capture_frames.clear()
-    single_capture_event.clear()
+    
+    # Access the event from the shared state and clear it for this new operation
+    capture_event = shared_state['single_capture_event']
+    capture_event.clear()
     
     # Tell UDP handlers to save the next frame
     for handler in udp_handlers.values():
@@ -248,7 +255,8 @@ async def handle_capture_single():
         
     # Wait for all 3 frames to be saved
     try:
-        await asyncio.wait_for(single_capture_event.wait(), timeout=10.0)
+        # Wait on the event from the shared state
+        await asyncio.wait_for(capture_event.wait(), timeout=10.0)
     except asyncio.TimeoutError:
         print("Timeout waiting for single frames.")
         await broadcast_to_web_clients({"status": "capture_failed_timeout"})
@@ -283,10 +291,13 @@ async def main():
     await connect_to_esps()
 
     loop = asyncio.get_event_loop()
+
+    # Now that the loop is running, we can safely create the event
+    shared_state['single_capture_event'] = asyncio.Event()
     
     for i, port in enumerate([10101, 10102, 10103], 1):
         # Store handler instances to modify their state
-        handler = UDPHandler(port)
+        handler = UDPHandler(port, shared_state)
         udp_handlers[str(i)] = handler
         await loop.create_datagram_endpoint(lambda: handler, local_addr=("0.0.0.0", port))
         print(f"UDP server started on 0.0.0.0:{port}")
