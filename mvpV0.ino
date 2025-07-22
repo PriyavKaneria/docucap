@@ -2,15 +2,12 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <esp_camera.h>
-#include <WiFiUdp.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
 // --- Configuration ---
 const char* ssid = "Digi_Nova";
 const char* password = "diginova";
-const char* udpAddress = "192.168.137.1"; // CHANGE THIS to your PC's IP
-const int udpPort = 10103; // CHANGE THIS for each ESP: 10101, 10102, 10103
 
 #define CAMERA_MODEL_AI_THINKER
 
@@ -19,7 +16,6 @@ const int udpPort = 10103; // CHANGE THIS for each ESP: 10101, 10102, 10103
 // --- System Variables ---
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
-WiFiUDP udp;
 
 volatile bool capture_and_send = false;
 volatile int frames_to_send = 0; // For calibration bursts
@@ -32,8 +28,6 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 
 void sendFrameTask(void *pvParameters) {
     camera_fb_t *fb = NULL;
-    const char* start_marker = "IMAGE_START";
-    const char* end_marker = "IMAGE_END";
 
     while (true) {
         if (capture_and_send) {
@@ -44,11 +38,11 @@ void sendFrameTask(void *pvParameters) {
                 continue;
             }
 
-            udp.beginPacket(udpAddress, udpPort);
-            udp.write((const uint8_t *)start_marker, strlen(start_marker));
-            udp.write(fb->buf, fb->len);
-            udp.write((const uint8_t *)end_marker, strlen(end_marker));
-            udp.endPacket();
+            // Send image data over WebSocket to all connected clients.
+            // The library's binaryAll function handles backpressure internally.
+            if (ws.count() > 0) {
+                ws.binaryAll(fb->buf, fb->len);
+            }
 
             esp_camera_fb_return(fb);
 
@@ -57,12 +51,12 @@ void sendFrameTask(void *pvParameters) {
                 if (frames_to_send == 0) {
                     capture_and_send = false;
                 }
-                // --- CHANGE HERE: Apply the calibration delay ---
-                vTaskDelay(calibration_delay_ms / portTICK_PERIOD_MS); 
-            } else {
-                // For normal live streaming, be as fast as possible
-                vTaskDelay(10 / portTICK_PERIOD_MS);
             }
+            
+            // Apply a consistent, stable delay to prevent overwhelming the network.
+            // This is the key to preventing disconnects.
+            vTaskDelay(calibration_delay_ms / portTICK_PERIOD_MS); 
+
         } else {
             vTaskDelay(100 / portTICK_PERIOD_MS);
         }
@@ -138,7 +132,6 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
             data[len] = 0;
             String msg = (char*)data;
             Serial.printf("Received command: %s\n", msg.c_str());
-
             if (msg == "start_capture") {
                 frames_to_send = -1; // Continuous capture
                 capture_and_send = true;

@@ -13,9 +13,9 @@ import stitching_logic
 
 # --- Configuration ---
 ESP_IPS = {
-    '1': '192.168.137.152', # 257AC8
-    '2': '192.168.137.193', # 24F7DC
-    '3': '192.168.137.129' # 255950
+    '1': '192.168.137.152',
+    '2': '192.168.137.193',
+    '3': '192.168.137.129'
 }
 ESP_WS_URL = "ws://{ip}/ws"
 CALIBRATION_RUN_DIR = "data/calibration_run"
@@ -40,8 +40,48 @@ async def connect_to_esps():
             ws = await asyncio.wait_for(session.ws_connect(ESP_WS_URL.format(ip=ip)), timeout=5.0)
             esp_websockets[esp_id] = (session, ws)
             print(f"Successfully connected to ESP {esp_id}")
+            # Start listening for messages from this ESP
+            asyncio.create_task(listen_to_esp(esp_id, ws))
         except Exception as e:
             print(f"Failed to connect to ESP {esp_id}: {e}")
+
+async def listen_to_esp(esp_id, ws):
+    try:
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.BINARY:
+                await handle_esp_binary_message(esp_id, msg.data)
+    except Exception as e:
+        print(f"Error listening to ESP {esp_id}: {e}")
+    finally:
+        print(f"ESP {esp_id} disconnected.")
+        # Optionally, try to reconnect
+        await asyncio.sleep(1)
+        asyncio.create_task(connect_to_esps()) # This could be more robust
+
+async def handle_esp_binary_message(esp_id, image_data):
+    try:
+        nparr = np.frombuffer(image_data, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if frame is None:
+            print(f"ESP {esp_id}: Failed to decode JPEG - corrupt data (size: {len(image_data)})")
+            return
+
+        if not stitching_logic.is_frame_sane(frame):
+            print(f"ESP {esp_id}: Frame failed sanity check")
+            return
+
+        print(f"ESP {esp_id}: Processing valid frame (shape: {frame.shape})")
+
+        if shared_state["is_live_calibrating"]:
+            await handle_live_calibration_frame(esp_id, frame)
+        elif shared_state["is_capturing_anchors"]:
+            await handle_anchor_capture_frame(esp_id, frame)
+        else:
+            await handle_normal_frame(esp_id, image_data)
+
+    except Exception as e:
+        print(f"ESP {esp_id}: Error processing image frame: {e}")
 
 async def send_to_esp(esp_id, message):
     if esp_id in esp_websockets and not esp_websockets[esp_id][1].closed:
@@ -55,164 +95,56 @@ async def broadcast_to_web_clients(message):
             print(f"Error broadcasting to client: {e}")
             connected_clients.discard(ws)
 
-# --- Enhanced UDP Frame Receiver with Frame Skipping ---
-class UDPHandler(asyncio.DatagramProtocol):
-    def __init__(self, port):
-        super().__init__()
-        self.port = port
-        self.esp_id = str(port)[-1]
-        self.buffer = b""
-        self.frame_count = 0
-        self.frames_to_skip = 2  # Skip first 2 frames
-        self.buffer_lock = asyncio.Lock()  # Add lock for thread safety
-
-    def connection_made(self, transport):
-        self.transport = transport
-        print(f"UDP server for ESP {self.esp_id} listening on port {self.port}")
-
-    def datagram_received(self, data, addr):
-        # Create task to handle data processing asynchronously
-        asyncio.create_task(self.handle_data(data))
-
-    async def handle_data(self, data):
-        """
-        Enhanced buffering logic with proper synchronization
-        """
-        async with self.buffer_lock:
-            self.buffer += data
-            
-            # Process all complete frames in the buffer
-            while b"IMAGE_END" in self.buffer:
-                start_idx = self.buffer.find(b"IMAGE_START")
-                end_idx = self.buffer.find(b"IMAGE_END")
-
-                if start_idx == -1:
-                    # No start marker found, discard everything up to IMAGE_END
-                    self.buffer = self.buffer[end_idx + len(b"IMAGE_END"):]
-                    continue
-
-                if start_idx > end_idx:
-                    # Start marker comes after end marker, discard up to start
-                    self.buffer = self.buffer[start_idx:]
-                    continue
-
-                # Extract complete image data
-                image_data = self.buffer[start_idx + len(b"IMAGE_START"):end_idx]
-                
-                # Remove processed data from buffer
-                self.buffer = self.buffer[end_idx + len(b"IMAGE_END"):]
-
-                # Process the frame (outside the lock to avoid blocking)
-                asyncio.create_task(self.process_image(image_data))
-
-    async def process_image(self, image_data):
-        """
-        Process complete image data with frame skipping
-        """
-        # Skip initial frames that are out of focus or greenish
-        if self.frame_count < self.frames_to_skip:
-            self.frame_count += 1
-            print(f"Skipping frame {self.frame_count} for ESP {self.esp_id}")
-            return
-        
-        if len(image_data) == 0:
-            print(f"ESP {self.esp_id}: Empty image data")
-            return
-
+async def handle_live_calibration_frame(esp_id, frame):
+    stitcher = shared_state["live_stitchers"].get(esp_id)
+    if stitcher:
         try:
-            # Decode JPEG image
-            nparr = np.frombuffer(image_data, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            timestamp = datetime.now().timestamp()
+            frame_path = f"{CALIBRATION_RUN_DIR}/esp_{esp_id}_frame_{timestamp}.jpg"
+            cv2.imwrite(frame_path, frame)
+            print(f"Saved calibration frame: {frame_path}")
             
-            if frame is None:
-                print(f"ESP {self.esp_id}: Failed to decode JPEG - corrupt data (size: {len(image_data)})")
-                return
+            # pano = stitcher.add_frame(frame)
+            # if pano is not None:
+            #     _, img_encoded = cv2.imencode('.jpg', pano, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+            #     message_data = bytes(esp_id, 'utf-8') + img_encoded.tobytes()
                 
+            #     for ws in list(connected_clients):
+            #         try:
+            #             await ws.send_bytes(message_data)
+            #         except Exception as e:
+            #             print(f"Error sending panorama to client: {e}")
+            #             connected_clients.discard(ws)
         except Exception as e:
-            print(f"ESP {self.esp_id}: JPEG decode error: {e} (data size: {len(image_data)})")
-            return
+            print(f"ESP {esp_id}: Error in live calibration processing: {e}")
 
-        # Validate frame quality
-        if not stitching_logic.is_frame_sane(frame):
-            print(f"ESP {self.esp_id}: Frame failed sanity check")
-            return
+async def handle_anchor_capture_frame(esp_id, frame):
+    try:
+        filename = f"{ANCHOR_FRAMES_DIR}/anchor_{esp_id}.jpg"
+        success = cv2.imwrite(filename, frame)
+        if success:
+            print(f"Saved anchor frame for ESP {esp_id}: {filename}")
+            shared_state["anchor_frames_received"][esp_id] = filename
+            
+            if len(shared_state["anchor_frames_received"]) == len(ESP_IPS):
+                if shared_state["anchor_capture_event"]:
+                    shared_state["anchor_capture_event"].set()
+        else:
+            print(f"Failed to save anchor frame for ESP {esp_id}")
+    except Exception as e:
+        print(f"ESP {esp_id}: Error saving anchor frame: {e}")
 
-        self.frame_count += 1
-        print(f"ESP {self.esp_id}: Processing valid frame {self.frame_count} (shape: {frame.shape})")
-
-        # Handle different modes
-        try:
-            if shared_state["is_live_calibrating"]:
-                await self.handle_live_calibration_frame(frame)
-            elif shared_state["is_capturing_anchors"]:
-                await self.handle_anchor_capture_frame(frame)
-            else:
-                await self.handle_normal_frame(image_data)
-        except Exception as e:
-            print(f"ESP {self.esp_id}: Error processing frame: {e}")
-
-    async def handle_live_calibration_frame(self, frame):
-        """Handle frame during live calibration"""
-        stitcher = shared_state["live_stitchers"].get(self.esp_id)
-        if stitcher:
+async def handle_normal_frame(esp_id, image_data):
+    try:
+        message_data = bytes(esp_id, 'utf-8') + image_data
+        for ws in list(connected_clients):
             try:
-                # Save frame for debugging
-                timestamp = datetime.now().timestamp()
-                frame_path = f"{CALIBRATION_RUN_DIR}/esp_{self.esp_id}_frame_{timestamp}.jpg"
-                cv2.imwrite(frame_path, frame)
-                print(f"Saved calibration frame: {frame_path}")
-                
-                # Add to stitcher
-                pano = stitcher.add_frame(frame)
-                if pano is not None:
-                    # Encode panorama and send to web clients
-                    _, img_encoded = cv2.imencode('.jpg', pano, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-                    message_data = bytes(self.esp_id, 'utf-8') + img_encoded.tobytes()
-                    
-                    for ws in list(connected_clients):
-                        try:
-                            await ws.send_bytes(message_data)
-                        except Exception as e:
-                            print(f"Error sending panorama to client: {e}")
-                            connected_clients.discard(ws)
+                await ws.send_bytes(message_data)
             except Exception as e:
-                print(f"ESP {self.esp_id}: Error in live calibration processing: {e}")
-
-    async def handle_anchor_capture_frame(self, frame):
-        """Handle frame during anchor capture"""
-        try:
-            filename = f"{ANCHOR_FRAMES_DIR}/anchor_{self.esp_id}.jpg"
-            success = cv2.imwrite(filename, frame)
-            if success:
-                print(f"Saved anchor frame for ESP {self.esp_id}: {filename}")
-                shared_state["anchor_frames_received"][self.esp_id] = filename
-                
-                # Check if all anchors received
-                if len(shared_state["anchor_frames_received"]) == len(ESP_IPS):
-                    if shared_state["anchor_capture_event"]:
-                        shared_state["anchor_capture_event"].set()
-            else:
-                print(f"Failed to save anchor frame for ESP {self.esp_id}")
-        except Exception as e:
-            print(f"ESP {self.esp_id}: Error saving anchor frame: {e}")
-
-    async def handle_normal_frame(self, image_data):
-        """Handle frame in normal streaming mode"""
-        try:
-            message_data = bytes(self.esp_id, 'utf-8') + image_data
-            for ws in list(connected_clients):
-                try:
-                    await ws.send_bytes(message_data)
-                except Exception as e:
-                    print(f"Error sending frame to client: {e}")
-                    connected_clients.discard(ws)
-        except Exception as e:
-            print(f"ESP {self.esp_id}: Error in normal frame handling: {e}")
-
-    def reset_frame_counter(self):
-        """Reset frame counter when starting new capture session"""
-        self.frame_count = 0
-        print(f"ESP {self.esp_id}: Frame counter reset")
+                print(f"Error sending frame to client: {e}")
+                connected_clients.discard(ws)
+    except Exception as e:
+        print(f"ESP {esp_id}: Error in normal frame handling: {e}")
 
 # --- Web Client Command Handlers & Workflow Logic ---
 async def client_handler(request):
@@ -254,21 +186,14 @@ async def client_handler(request):
 async def handle_start_live_calibration():
     print("Starting live calibration...")
     try:
-        # Reset frame counters for all ESPs
-        for handler in udp_handlers.values():
-            handler.reset_frame_counter()
-        
-        # Clean and recreate calibration directory
         shutil.rmtree(CALIBRATION_RUN_DIR, ignore_errors=True)
         os.makedirs(CALIBRATION_RUN_DIR, exist_ok=True)
         
-        # Initialize stitchers
         shared_state["live_stitchers"] = {
             esp_id: stitching_logic.LiveIncrementalStitcher() for esp_id in ESP_IPS
         }
         shared_state["is_live_calibrating"] = True
         
-        # Start capture on all ESPs
         for esp_id in ESP_IPS:
             await send_to_esp(esp_id, "start_capture")
         
@@ -284,7 +209,6 @@ async def handle_stop_live_calibration():
         shared_state["is_live_calibrating"] = False
         shared_state["live_stitchers"].clear()
         
-        # Stop capture on all ESPs
         for esp_id in ESP_IPS:
             await send_to_esp(esp_id, "stop_capture")
         
@@ -312,24 +236,16 @@ async def handle_capture_anchors():
     try:
         await broadcast_to_web_clients({"status": "capturing_anchors_started"})
         
-        # Reset frame counters
-        for handler in udp_handlers.values():
-            handler.reset_frame_counter()
-        
-        # Clean and recreate anchor frames directory
         shutil.rmtree(ANCHOR_FRAMES_DIR, ignore_errors=True)
         os.makedirs(ANCHOR_FRAMES_DIR, exist_ok=True)
         
-        # Reset state
         shared_state["anchor_frames_received"].clear()
         shared_state["anchor_capture_event"] = asyncio.Event()
         shared_state["is_capturing_anchors"] = True
         
-        # Request single frame from all ESPs
         for esp_id in ESP_IPS:
             await send_to_esp(esp_id, "capture_single_frame")
         
-        # Wait for all frames with timeout
         await asyncio.wait_for(shared_state["anchor_capture_event"].wait(), timeout=15.0)
         await broadcast_to_web_clients({"status": "capturing_anchors_complete"})
         print("Anchor capture completed successfully")
@@ -361,7 +277,6 @@ async def handle_calculate_placements():
 
 async def handle_capture_single_final():
     try:
-        # First capture anchor frames
         capture_task = asyncio.create_task(handle_capture_anchors())
         await capture_task
         
@@ -387,29 +302,13 @@ async def handle_capture_single_final():
         print(f"Error in capture single final: {e}")
         await broadcast_to_web_clients({"status": "capture_stitch_failed", "error": str(e)})
 
-# Global reference to UDP handlers for frame counter reset
-udp_handlers = {}
-
 async def main():
-    global udp_handlers
-    
     try:
-        # Create necessary directories
         os.makedirs("data/final_stitched", exist_ok=True)
         os.makedirs("data", exist_ok=True)
         
-        # Connect to ESPs
         await connect_to_esps()
         
-        # Create UDP servers
-        loop = asyncio.get_running_loop()
-        for i, port in enumerate([10101, 10102, 10103], 1):
-            handler = UDPHandler(port)
-            udp_handlers[str(i)] = handler
-            await loop.create_datagram_endpoint(lambda h=handler: h, local_addr=("0.0.0.0", port))
-            print(f"Created UDP server on port {port} for ESP {i}")
-        
-        # Create web server
         app = aiohttp.web.Application()
         app.add_routes([aiohttp.web.get("/bridge", client_handler)])
         runner = aiohttp.web.AppRunner(app)
@@ -420,7 +319,6 @@ async def main():
         print("Server running at http://127.0.0.1:8080")
         print("Ready to receive frames from ESPs...")
         
-        # Keep the server running
         await asyncio.Event().wait()
         
     except Exception as e:
