@@ -3,338 +3,434 @@ import aiohttp.web
 import asyncio
 import os
 import json
+import glob
 from datetime import datetime
-# --- NEW: Import your stitching logic ---
+import shutil
+import cv2
+import numpy as np
+
 import stitching_logic
 
 # --- Configuration ---
 ESP_IPS = {
-    '1': '192.168.137.239',  # esp32-257AC8
-    '2': '192.168.137.74',  # esp32-24F7DC
-    '3': '192.168.137.16', # esp32-255950 
+    '1': '192.168.137.152', # 257AC8
+    '2': '192.168.137.193', # 24F7DC
+    '3': '192.168.137.129' # 255950
 }
 ESP_WS_URL = "ws://{ip}/ws"
-CALIBRATION_FRAME_COUNT = 15 # Set desired number of frames here
+CALIBRATION_RUN_DIR = "data/calibration_run"
+ANCHOR_FRAMES_DIR = "data/anchor_frames"
 
 # --- Global State ---
 connected_clients = set()
 esp_websockets = {}
-is_calibrating = False
-# --- NEW: State for single frame capture ---
-single_capture_frames = {}
-# Create a dictionary to hold our shared state, including asyncio primitives
-shared_state = {}
+shared_state = {
+    "is_live_calibrating": False,
+    "is_capturing_anchors": False,
+    "live_stitchers": {},
+    "anchor_capture_event": None,
+    "anchor_frames_received": {},
+}
 
-
-# --- WebSocket and UDP Handling (Modified) ---
-
+# --- WebSocket and Networking ---
 async def connect_to_esps():
-    """Establish WebSocket connections to all ESP32 modules."""
     for esp_id, ip in ESP_IPS.items():
         try:
             session = aiohttp.ClientSession()
-            ws_url = ESP_WS_URL.format(ip=ip)
-            # Add a timeout to the connection attempt
-            ws = await asyncio.wait_for(session.ws_connect(ws_url), timeout=5.0)
+            ws = await asyncio.wait_for(session.ws_connect(ESP_WS_URL.format(ip=ip)), timeout=5.0)
             esp_websockets[esp_id] = (session, ws)
-            print(f"Successfully connected to ESP {esp_id} at {ws_url}")
+            print(f"Successfully connected to ESP {esp_id}")
         except Exception as e:
             print(f"Failed to connect to ESP {esp_id}: {e}")
 
 async def send_to_esp(esp_id, message):
-    """Send a message to a specific ESP32."""
-    if esp_id in esp_websockets:
-        _, ws = esp_websockets[esp_id]
-        if not ws.closed:
-            try:
-                await ws.send_str(message)
-                print(f"Sent '{message}' to ESP {esp_id}")
-            except Exception as e:
-                print(f"Error sending to ESP {esp_id}: {e}")
-        else:
-            print(f"ESP {esp_id} WebSocket is closed.")
-    else:
-        print(f"ESP {esp_id} is not connected.")
-
+    if esp_id in esp_websockets and not esp_websockets[esp_id][1].closed:
+        await esp_websockets[esp_id][1].send_str(message)
 
 async def broadcast_to_web_clients(message):
-    """Broadcast a message to all connected web clients."""
     for ws in list(connected_clients):
         try:
             await ws.send_json(message)
         except Exception as e:
-            print(f"Failed to send message to web client: {e}")
+            print(f"Error broadcasting to client: {e}")
+            connected_clients.discard(ws)
 
+# --- Enhanced UDP Frame Receiver with Frame Skipping ---
+class UDPHandler(asyncio.DatagramProtocol):
+    def __init__(self, port):
+        super().__init__()
+        self.port = port
+        self.esp_id = str(port)[-1]
+        self.buffer = b""
+        self.frame_count = 0
+        self.frames_to_skip = 2  # Skip first 2 frames
+        self.buffer_lock = asyncio.Lock()  # Add lock for thread safety
+
+    def connection_made(self, transport):
+        self.transport = transport
+        print(f"UDP server for ESP {self.esp_id} listening on port {self.port}")
+
+    def datagram_received(self, data, addr):
+        # Create task to handle data processing asynchronously
+        asyncio.create_task(self.handle_data(data))
+
+    async def handle_data(self, data):
+        """
+        Enhanced buffering logic with proper synchronization
+        """
+        async with self.buffer_lock:
+            self.buffer += data
+            
+            # Process all complete frames in the buffer
+            while b"IMAGE_END" in self.buffer:
+                start_idx = self.buffer.find(b"IMAGE_START")
+                end_idx = self.buffer.find(b"IMAGE_END")
+
+                if start_idx == -1:
+                    # No start marker found, discard everything up to IMAGE_END
+                    self.buffer = self.buffer[end_idx + len(b"IMAGE_END"):]
+                    continue
+
+                if start_idx > end_idx:
+                    # Start marker comes after end marker, discard up to start
+                    self.buffer = self.buffer[start_idx:]
+                    continue
+
+                # Extract complete image data
+                image_data = self.buffer[start_idx + len(b"IMAGE_START"):end_idx]
+                
+                # Remove processed data from buffer
+                self.buffer = self.buffer[end_idx + len(b"IMAGE_END"):]
+
+                # Process the frame (outside the lock to avoid blocking)
+                asyncio.create_task(self.process_image(image_data))
+
+    async def process_image(self, image_data):
+        """
+        Process complete image data with frame skipping
+        """
+        # Skip initial frames that are out of focus or greenish
+        if self.frame_count < self.frames_to_skip:
+            self.frame_count += 1
+            print(f"Skipping frame {self.frame_count} for ESP {self.esp_id}")
+            return
+        
+        if len(image_data) == 0:
+            print(f"ESP {self.esp_id}: Empty image data")
+            return
+
+        try:
+            # Decode JPEG image
+            nparr = np.frombuffer(image_data, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if frame is None:
+                print(f"ESP {self.esp_id}: Failed to decode JPEG - corrupt data (size: {len(image_data)})")
+                return
+                
+        except Exception as e:
+            print(f"ESP {self.esp_id}: JPEG decode error: {e} (data size: {len(image_data)})")
+            return
+
+        # Validate frame quality
+        if not stitching_logic.is_frame_sane(frame):
+            print(f"ESP {self.esp_id}: Frame failed sanity check")
+            return
+
+        self.frame_count += 1
+        print(f"ESP {self.esp_id}: Processing valid frame {self.frame_count} (shape: {frame.shape})")
+
+        # Handle different modes
+        try:
+            if shared_state["is_live_calibrating"]:
+                await self.handle_live_calibration_frame(frame)
+            elif shared_state["is_capturing_anchors"]:
+                await self.handle_anchor_capture_frame(frame)
+            else:
+                await self.handle_normal_frame(image_data)
+        except Exception as e:
+            print(f"ESP {self.esp_id}: Error processing frame: {e}")
+
+    async def handle_live_calibration_frame(self, frame):
+        """Handle frame during live calibration"""
+        stitcher = shared_state["live_stitchers"].get(self.esp_id)
+        if stitcher:
+            try:
+                # Save frame for debugging
+                timestamp = datetime.now().timestamp()
+                frame_path = f"{CALIBRATION_RUN_DIR}/esp_{self.esp_id}_frame_{timestamp}.jpg"
+                cv2.imwrite(frame_path, frame)
+                print(f"Saved calibration frame: {frame_path}")
+                
+                # Add to stitcher
+                pano = stitcher.add_frame(frame)
+                if pano is not None:
+                    # Encode panorama and send to web clients
+                    _, img_encoded = cv2.imencode('.jpg', pano, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+                    message_data = bytes(self.esp_id, 'utf-8') + img_encoded.tobytes()
+                    
+                    for ws in list(connected_clients):
+                        try:
+                            await ws.send_bytes(message_data)
+                        except Exception as e:
+                            print(f"Error sending panorama to client: {e}")
+                            connected_clients.discard(ws)
+            except Exception as e:
+                print(f"ESP {self.esp_id}: Error in live calibration processing: {e}")
+
+    async def handle_anchor_capture_frame(self, frame):
+        """Handle frame during anchor capture"""
+        try:
+            filename = f"{ANCHOR_FRAMES_DIR}/anchor_{self.esp_id}.jpg"
+            success = cv2.imwrite(filename, frame)
+            if success:
+                print(f"Saved anchor frame for ESP {self.esp_id}: {filename}")
+                shared_state["anchor_frames_received"][self.esp_id] = filename
+                
+                # Check if all anchors received
+                if len(shared_state["anchor_frames_received"]) == len(ESP_IPS):
+                    if shared_state["anchor_capture_event"]:
+                        shared_state["anchor_capture_event"].set()
+            else:
+                print(f"Failed to save anchor frame for ESP {self.esp_id}")
+        except Exception as e:
+            print(f"ESP {self.esp_id}: Error saving anchor frame: {e}")
+
+    async def handle_normal_frame(self, image_data):
+        """Handle frame in normal streaming mode"""
+        try:
+            message_data = bytes(self.esp_id, 'utf-8') + image_data
+            for ws in list(connected_clients):
+                try:
+                    await ws.send_bytes(message_data)
+                except Exception as e:
+                    print(f"Error sending frame to client: {e}")
+                    connected_clients.discard(ws)
+        except Exception as e:
+            print(f"ESP {self.esp_id}: Error in normal frame handling: {e}")
+
+    def reset_frame_counter(self):
+        """Reset frame counter when starting new capture session"""
+        self.frame_count = 0
+        print(f"ESP {self.esp_id}: Frame counter reset")
+
+# --- Web Client Command Handlers & Workflow Logic ---
 async def client_handler(request):
     ws = aiohttp.web.WebSocketResponse()
     await ws.prepare(request)
     connected_clients.add(ws)
     print("Web client connected")
-
     try:
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
                     command = data.get("command")
-                    print(f"Received command from web client: {command}")
-
-                    if command == "start_all_streams":
-                        asyncio.create_task(handle_start_all_streams())
-                    elif command == "stop_all_streams":
-                        asyncio.create_task(handle_stop_all_streams())
-                    elif command == "calibrate":
-                        asyncio.create_task(handle_calibration())
-                    elif command == "process_calibration":
-                        asyncio.create_task(handle_process_calibration())
-                    elif command == "calculate_homography":
-                        asyncio.create_task(handle_calculate_homography())
-                    # --- NEW: Handle single capture command ---
-                    elif command == "capture_single":
-                        asyncio.create_task(handle_capture_single())
-
-                except json.JSONDecodeError:
-                    print(f"Invalid JSON received: {msg.data}")
+                    print(f"Received command: {command}")
+                    
+                    if command == "start_live_calibration": 
+                        await handle_start_live_calibration()
+                    elif command == "stop_live_calibration": 
+                        await handle_stop_live_calibration()
+                    elif command == "build_reference": 
+                        asyncio.create_task(handle_build_reference())
+                    elif command == "capture_anchors": 
+                        asyncio.create_task(handle_capture_anchors())
+                    elif command == "calculate_placements": 
+                        asyncio.create_task(handle_calculate_placements())
+                    elif command == "capture_single": 
+                        asyncio.create_task(handle_capture_single_final())
+                except json.JSONDecodeError as e:
+                    print(f"JSON decode error: {e}")
+                except Exception as e:
+                    print(f"Error handling client message: {e}")
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        print(f"Client handler error: {e}")
     finally:
-        connected_clients.remove(ws)
+        connected_clients.discard(ws)
         print("Web client disconnected")
     return ws
 
-async def broadcast_image_to_web(image_data):
-    for ws in list(connected_clients):
-        try:
-            await ws.send_bytes(image_data)
-        except Exception as e:
-            print(f"Failed to send image to client: {e}")
-
-class UDPHandler(asyncio.DatagramProtocol):
-    def __init__(self, port, shared_state):
-        super().__init__()
-        self.buffer = b""
-        self.shared_state = shared_state # Store the shared state
-        self.port = port
-        self.timeout_task = None
-        self.calibration_frame_count = 0
-        self.is_capturing_single = False
-
-    def connection_made(self, transport):
-        self.transport = transport
-        print(f"UDP server listening on port {self.port}")
-
-    def datagram_received(self, data, addr):
-        asyncio.create_task(self.process_datagram(data))
-
-    async def process_datagram(self, data):
-        self.buffer += data
+async def handle_start_live_calibration():
+    print("Starting live calibration...")
+    try:
+        # Reset frame counters for all ESPs
+        for handler in udp_handlers.values():
+            handler.reset_frame_counter()
         
-        if b"IMAGE_END" in self.buffer:
-            start_idx = self.buffer.find(b"IMAGE_START")
-            end_idx = self.buffer.find(b"IMAGE_END")
-
-            if start_idx != -1:
-                image_data = self.buffer[start_idx + len(b"IMAGE_START"):end_idx]
-                self.buffer = self.buffer[end_idx + len(b"IMAGE_END"):]
-
-                esp_id = str(self.port)[-1]
-                
-                # --- MODIFIED: Handle different capture modes ---
-                if self.is_capturing_single:
-                    filename = f"data/single_frames/esp{esp_id}_capture.jpg"
-                    os.makedirs(os.path.dirname(filename), exist_ok=True)
-                    with open(filename, 'wb') as f:
-                        f.write(image_data)
-                    single_capture_frames[esp_id] = filename
-                    print(f"Saved single capture for ESP {esp_id}")
-                    self.is_capturing_single = False
-                    
-                    if len(single_capture_frames) == len(ESP_IPS):
-                        # Use the event from the shared state dictionary
-                        self.shared_state['single_capture_event'].set()
-
-                elif is_calibrating and self.calibration_frame_count < CALIBRATION_FRAME_COUNT:
-                    self.calibration_frame_count += 1
-                    filename = f"data/calibration/esp{esp_id}/frame_{self.calibration_frame_count:02d}.jpg"
-                    os.makedirs(os.path.dirname(filename), exist_ok=True)
-                    with open(filename, 'wb') as f:
-                        f.write(image_data)
-                    
-                    # --- CHANGE HERE: Use the constant ---
-                    if self.calibration_frame_count == CALIBRATION_FRAME_COUNT:
-                        await broadcast_to_web_clients({
-                            "status": "calibration_capture_complete", 
-                            "esp_id": esp_id
-                        })
-                        
-                else:
-                    # Default behavior: Just broadcast for live view
-                    image_data_with_id = bytes(esp_id, 'utf-8') + image_data
-                    await broadcast_image_to_web(image_data_with_id)
-
-    def error_received(self, exc):
-        print(f"Error received: {exc}")
+        # Clean and recreate calibration directory
+        shutil.rmtree(CALIBRATION_RUN_DIR, ignore_errors=True)
+        os.makedirs(CALIBRATION_RUN_DIR, exist_ok=True)
         
-# --- Global UDP Handlers dictionary ---
+        # Initialize stitchers
+        shared_state["live_stitchers"] = {
+            esp_id: stitching_logic.LiveIncrementalStitcher() for esp_id in ESP_IPS
+        }
+        shared_state["is_live_calibrating"] = True
+        
+        # Start capture on all ESPs
+        for esp_id in ESP_IPS:
+            await send_to_esp(esp_id, "start_capture")
+        
+        await broadcast_to_web_clients({"status": "live_calibration_started"})
+        print("Live calibration started successfully")
+    except Exception as e:
+        print(f"Error starting live calibration: {e}")
+        await broadcast_to_web_clients({"status": "live_calibration_error", "error": str(e)})
+
+async def handle_stop_live_calibration():
+    print("Stopping live calibration...")
+    try:
+        shared_state["is_live_calibrating"] = False
+        shared_state["live_stitchers"].clear()
+        
+        # Stop capture on all ESPs
+        for esp_id in ESP_IPS:
+            await send_to_esp(esp_id, "stop_capture")
+        
+        await broadcast_to_web_clients({"status": "live_calibration_stopped"})
+        print("Live calibration stopped successfully")
+    except Exception as e:
+        print(f"Error stopping live calibration: {e}")
+
+async def handle_build_reference():
+    try:
+        await broadcast_to_web_clients({"status": "building_reference_started"})
+        loop = asyncio.get_event_loop()
+        ref_path = await loop.run_in_executor(None, stitching_logic.build_reference_panorama, CALIBRATION_RUN_DIR)
+        if ref_path:
+            await broadcast_to_web_clients({"status": "building_reference_complete", "path": ref_path})
+            print(f"Reference panorama built: {ref_path}")
+        else:
+            await broadcast_to_web_clients({"status": "building_reference_failed"})
+            print("Failed to build reference panorama")
+    except Exception as e:
+        print(f"Error building reference: {e}")
+        await broadcast_to_web_clients({"status": "building_reference_failed", "error": str(e)})
+
+async def handle_capture_anchors():
+    try:
+        await broadcast_to_web_clients({"status": "capturing_anchors_started"})
+        
+        # Reset frame counters
+        for handler in udp_handlers.values():
+            handler.reset_frame_counter()
+        
+        # Clean and recreate anchor frames directory
+        shutil.rmtree(ANCHOR_FRAMES_DIR, ignore_errors=True)
+        os.makedirs(ANCHOR_FRAMES_DIR, exist_ok=True)
+        
+        # Reset state
+        shared_state["anchor_frames_received"].clear()
+        shared_state["anchor_capture_event"] = asyncio.Event()
+        shared_state["is_capturing_anchors"] = True
+        
+        # Request single frame from all ESPs
+        for esp_id in ESP_IPS:
+            await send_to_esp(esp_id, "capture_single_frame")
+        
+        # Wait for all frames with timeout
+        await asyncio.wait_for(shared_state["anchor_capture_event"].wait(), timeout=15.0)
+        await broadcast_to_web_clients({"status": "capturing_anchors_complete"})
+        print("Anchor capture completed successfully")
+        
+    except asyncio.TimeoutError:
+        print("Anchor capture timed out")
+        await broadcast_to_web_clients({"status": "capturing_anchors_failed", "error": "timeout"})
+    except Exception as e:
+        print(f"Error capturing anchors: {e}")
+        await broadcast_to_web_clients({"status": "capturing_anchors_failed", "error": str(e)})
+    finally:
+        shared_state["is_capturing_anchors"] = False
+
+async def handle_calculate_placements():
+    try:
+        await broadcast_to_web_clients({"status": "calculating_placements_started"})
+        anchor_paths = {str(i+1): f"{ANCHOR_FRAMES_DIR}/anchor_{i+1}.jpg" for i in range(len(ESP_IPS))}
+        loop = asyncio.get_event_loop()
+        placements_path = await loop.run_in_executor(None, stitching_logic.calculate_placement_homographies, "data/reference_panorama.jpg", anchor_paths)
+        if placements_path:
+            await broadcast_to_web_clients({"status": "calculating_placements_complete", "path": placements_path})
+            print(f"Placements calculated: {placements_path}")
+        else:
+            await broadcast_to_web_clients({"status": "calculating_placements_failed"})
+            print("Failed to calculate placements")
+    except Exception as e:
+        print(f"Error calculating placements: {e}")
+        await broadcast_to_web_clients({"status": "calculating_placements_failed", "error": str(e)})
+
+async def handle_capture_single_final():
+    try:
+        # First capture anchor frames
+        capture_task = asyncio.create_task(handle_capture_anchors())
+        await capture_task
+        
+        if len(shared_state["anchor_frames_received"]) != len(ESP_IPS):
+            await broadcast_to_web_clients({
+                "status": "capture_stitch_failed", 
+                "reason": f"Did not receive all frames. Got {len(shared_state['anchor_frames_received'])}/{len(ESP_IPS)}"
+            })
+            return
+        
+        await broadcast_to_web_clients({"status": "stitching_final_frame"})
+        frame_paths = [shared_state["anchor_frames_received"][str(i+1)] for i in range(len(ESP_IPS))]
+        loop = asyncio.get_event_loop()
+        stitched_path = await loop.run_in_executor(None, stitching_logic.stitch_from_placements, frame_paths, "data/camera_placements.npy", "data/reference_panorama.jpg")
+        
+        if stitched_path:
+            await broadcast_to_web_clients({"status": "capture_stitch_complete", "stitched_image_path": stitched_path})
+            print(f"Final stitch completed: {stitched_path}")
+        else:
+            await broadcast_to_web_clients({"status": "capture_stitch_failed"})
+            print("Failed to stitch final image")
+    except Exception as e:
+        print(f"Error in capture single final: {e}")
+        await broadcast_to_web_clients({"status": "capture_stitch_failed", "error": str(e)})
+
+# Global reference to UDP handlers for frame counter reset
 udp_handlers = {}
 
-# --- Command Handling Logic (Updated) ---
-async def handle_calibration():
-    global is_calibrating
-    is_calibrating = True
-    for handler in udp_handlers.values():
-        handler.calibration_frame_count = 0 
-        
-    print(f"Starting calibration, requesting {CALIBRATION_FRAME_COUNT} frames...")
-    await broadcast_to_web_clients({"status": f"calibration_started_{CALIBRATION_FRAME_COUNT}_frames"})
-    
-    command_to_send = f"start_calibration:{CALIBRATION_FRAME_COUNT}"
-    for esp_id in ESP_IPS:
-        await send_to_esp(esp_id, command_to_send)
-
-async def handle_process_calibration():
-    print("Processing calibration images...")
-    await broadcast_to_web_clients({"status": "processing_started"})
-    
-    loop = asyncio.get_event_loop()
-    panorama_paths = {}
-    
-    for esp_id in ESP_IPS:
-        # --- USE YOUR STITCHING LOGIC ---
-        path = await loop.run_in_executor(None, stitching_logic.stitch_calibration_images, esp_id)
-        if path:
-            panorama_paths[esp_id] = path
-
-    print("All panoramas stitched.")
-    await broadcast_to_web_clients({
-        "status": "processing_complete",
-        "panorama_paths": panorama_paths
-    })
-    global is_calibrating
-    is_calibrating = False
-
-async def handle_calculate_homography():
-    print("Calculating homography...")
-    await broadcast_to_web_clients({"status": "homography_started"})
-    
-    panorama_paths = [f"data/stitched_panoramas/esp{i}_panorama.jpg" for i in ESP_IPS.keys()]
-    
-    loop = asyncio.get_event_loop()
-    # --- USE YOUR STITCHING LOGIC ---
-    final_image, matrices_path = await loop.run_in_executor(None, stitching_logic.calculate_homography_and_stitch, panorama_paths)
-    
-    if final_image and matrices_path:
-        print("Homography calculation complete.")
-        await broadcast_to_web_clients({
-            "status": "homography_complete",
-            "final_image_path": final_image
-        })
-    else:
-        print("Homography calculation failed.")
-        await broadcast_to_web_clients({"status": "homography_failed"})
-
-# --- NEW: Single Capture Handler ---
-async def handle_capture_single():
-    # This function now correctly accesses the global shared_state
-    global single_capture_frames 
-    print("Starting single frame capture...")
-    
-    single_capture_frames.clear()
-    
-    # Access the event from the shared state and clear it for this new operation
-    capture_event = shared_state['single_capture_event']
-    capture_event.clear()
-    
-    # Tell UDP handlers to save the next frame
-    for handler in udp_handlers.values():
-        handler.is_capturing_single = True
-        
-    # Tell ESPs to send one frame
-    for esp_id in ESP_IPS:
-        await send_to_esp(esp_id, "capture_single_frame")
-        
-    # Wait for all 3 frames to be saved
-    try:
-        # Wait on the event from the shared state
-        await asyncio.wait_for(capture_event.wait(), timeout=10.0)
-    except asyncio.TimeoutError:
-        print("Timeout waiting for single frames.")
-        await broadcast_to_web_clients({"status": "capture_failed_timeout"})
-        return
-        
-    print("All single frames received. Stitching...")
-    await broadcast_to_web_clients({"status": "stitching_single_frames"})
-    
-    frame_paths = [single_capture_frames[id] for id in sorted(single_capture_frames.keys())]
-    
-    loop = asyncio.get_event_loop()
-    # --- USE YOUR FAST STITCHING LOGIC ---
-    stitched_path = await loop.run_in_executor(None, stitching_logic.stitch_single_frames, frame_paths)
-    
-    if stitched_path:
-        await broadcast_to_web_clients({
-            "status": "capture_stitch_complete",
-            "stitched_image_path": stitched_path
-        })
-    else:
-        await broadcast_to_web_clients({"status": "capture_stitch_failed"})
-
-# --- Main Application Setup ---
 async def main():
-    os.makedirs("data/calibration/esp1", exist_ok=True)
-    os.makedirs("data/calibration/esp2", exist_ok=True)
-    os.makedirs("data/calibration/esp3", exist_ok=True)
-    os.makedirs("data/stitched_panoramas", exist_ok=True)
-    os.makedirs("data/final_stitched", exist_ok=True)
-    os.makedirs("data/single_frames", exist_ok=True)
-
-    await connect_to_esps()
-
-    loop = asyncio.get_event_loop()
-
-    # Now that the loop is running, we can safely create the event
-    shared_state['single_capture_event'] = asyncio.Event()
+    global udp_handlers
     
-    for i, port in enumerate([10101, 10102, 10103], 1):
-        # Store handler instances to modify their state
-        handler = UDPHandler(port, shared_state)
-        udp_handlers[str(i)] = handler
-        await loop.create_datagram_endpoint(lambda: handler, local_addr=("0.0.0.0", port))
-        print(f"UDP server started on 0.0.0.0:{port}")
-
-    app = aiohttp.web.Application()
-    app.add_routes([aiohttp.web.get("/bridge", client_handler)])
-    runner = aiohttp.web.AppRunner(app)
-    await runner.setup()
-    site = aiohttp.web.TCPSite(runner, host="127.0.0.1", port=8080)
-    await site.start()
-    print("WebSocket server started on http://127.0.0.1:8080/bridge")
-
     try:
+        # Create necessary directories
+        os.makedirs("data/final_stitched", exist_ok=True)
+        os.makedirs("data", exist_ok=True)
+        
+        # Connect to ESPs
+        await connect_to_esps()
+        
+        # Create UDP servers
+        loop = asyncio.get_running_loop()
+        for i, port in enumerate([10101, 10102, 10103], 1):
+            handler = UDPHandler(port)
+            udp_handlers[str(i)] = handler
+            await loop.create_datagram_endpoint(lambda h=handler: h, local_addr=("0.0.0.0", port))
+            print(f"Created UDP server on port {port} for ESP {i}")
+        
+        # Create web server
+        app = aiohttp.web.Application()
+        app.add_routes([aiohttp.web.get("/bridge", client_handler)])
+        runner = aiohttp.web.AppRunner(app)
+        await runner.setup()
+        site = aiohttp.web.TCPSite(runner, "127.0.0.1", 8080)
+        await site.start()
+        
+        print("Server running at http://127.0.0.1:8080")
+        print("Ready to receive frames from ESPs...")
+        
+        # Keep the server running
         await asyncio.Event().wait()
-    finally:
-        await runner.cleanup()
-        for session, ws in esp_websockets.values():
-            await session.close()
-
-# --- NEW: Command Handlers for Live Streaming Test ---
-async def handle_start_all_streams():
-    """Sends the 'start_capture' command to all connected ESPs."""
-    print("Broadcasting start stream command to all ESPs...")
-    await broadcast_to_web_clients({"status": "Live streaming started."})
-    for esp_id in ESP_IPS:
-        # The ESPs already understand 'start_capture' for continuous streaming
-        await send_to_esp(esp_id, "start_capture")
-
-async def handle_stop_all_streams():
-    """Sends the 'stop_capture' command to all connected ESPs."""
-    print("Broadcasting stop stream command to all ESPs...")
-    await broadcast_to_web_clients({"status": "Live streaming stopped."})
-    for esp_id in ESP_IPS:
-        await send_to_esp(esp_id, "stop_capture")
+        
+    except Exception as e:
+        print(f"Error in main: {e}")
+        raise
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Shutting down.")
+        print("\nShutting down gracefully...")
+    except Exception as e:
+        print(f"Fatal error: {e}")
