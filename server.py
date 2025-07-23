@@ -221,7 +221,7 @@ async def handle_build_reference():
     try:
         await broadcast_to_web_clients({"status": "building_reference_started"})
         loop = asyncio.get_event_loop()
-        ref_path = await loop.run_in_executor(None, stitching_logic.build_reference_panorama, CALIBRATION_RUN_DIR)
+        ref_path = await loop.run_in_executor(None, stitching_logic.build_reference_panorama_efficient, CALIBRATION_RUN_DIR)
         if ref_path:
             await broadcast_to_web_clients({"status": "building_reference_complete", "path": ref_path})
             print(f"Reference panorama built: {ref_path}")
