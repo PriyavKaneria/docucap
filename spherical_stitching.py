@@ -199,28 +199,64 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Bypass detail module stitcher.")
     parser.add_argument("image_dir", type=str, help="Path to the directory containing images to stitch.")
     parser.add_argument("-o", "--output", type=str, default="panorama_bypass.jpg", help="Output file name.")
-    parser.add_argument("--method", choices=['simple', 'manual'], default='simple', 
-                       help="Stitching method: 'simple' uses cv2.Stitcher, 'manual' implements custom stitching")
+    parser.add_argument("--method", choices=['simple', 'manual'], default='simple',
+                        help="Stitching method: 'simple' uses cv2.Stitcher, 'manual' implements custom stitching")
+    parser.add_argument("--order", type=str, default="esp3,esp2,esp1",
+                        help="Comma-separated list of camera IDs in the desired stitching order (e.g., 'esp3,esp2,esp1').")
     args = parser.parse_args()
 
+    # --- Custom Sorting Logic ---
+    # Build a priority map from the --order argument
+    camera_order_list = [item.strip() for item in args.order.split(',')]
+    camera_order_map = {cam_id: index for index, cam_id in enumerate(camera_order_list)}
+
+    def get_sort_key(image_path):
+        """
+        Parses the image filename to determine its sort order.
+        Sorts by camera ID based on the --order argument, then by timestamp.
+        """
+        import re
+        filename = os.path.basename(image_path)
+        # Regex to extract camera number and timestamp from filenames like 'esp_3_frame_12345.678.jpg'
+        match = re.search(r'esp_(\d+)_frame_([\d.]+)\.jpg', filename)
+        if match:
+            camera_num = int(match.group(1))
+            cam_id = f"esp{camera_num}" # Create ID like 'esp3'
+            timestamp = float(match.group(2))
+            
+            # Get priority, default to a high number if camera not in the order list
+            priority = camera_order_map.get(cam_id, 999)
+            return (priority, timestamp)
+        
+        # Return a default tuple for files that don't match the pattern
+        return (999, 0)
+
+    # --- Image Loading and Sorting ---
     image_extensions = ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff"]
     image_paths = []
     for ext in image_extensions:
         image_paths.extend(glob.glob(os.path.join(args.image_dir, ext)))
-    image_paths.sort()
+
+    # Apply the custom sorting function
+    image_paths.sort(key=get_sort_key)
 
     if not image_paths:
         print(f"No images found in directory: {args.image_dir}")
         sys.exit(1)
-        
+
     print(f"Found {len(image_paths)} images to process.")
-    print(f"OpenCV version: {cv2.__version__}")
+    print("--- Sorted Image Order ---")
+    for path in image_paths:
+        print(f"  - {os.path.basename(path)}")
+    print("--------------------------")
     
+    print(f"OpenCV version: {cv2.__version__}")
+
     if args.method == 'simple':
         stitcher = SimpleSphericalStitcher(image_paths)
     else:
         stitcher = ManualSphericalStitcher(image_paths)
-        
+
     final_panorama = stitcher.stitch(output_path=args.output)
 
     if final_panorama is not None:

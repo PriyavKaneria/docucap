@@ -123,6 +123,10 @@ class SphericalPanoramaViewer:
         self.canvas = tk.Canvas(content_frame, bg='black', width=self.view_width, height=self.view_height)
         self.canvas.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
         
+        # Store image reference to prevent garbage collection
+        self.current_photo = None
+        self.canvas_ready = False
+        
         # Bind mouse events
         self.canvas.bind('<Button-1>', self.on_mouse_down)
         self.canvas.bind('<B1-Motion>', self.on_mouse_drag)
@@ -130,10 +134,15 @@ class SphericalPanoramaViewer:
         self.canvas.bind('<MouseWheel>', self.on_mouse_wheel)
         self.canvas.bind('<Button-4>', self.on_mouse_wheel)  # Linux
         self.canvas.bind('<Button-5>', self.on_mouse_wheel)  # Linux
+        self.canvas.bind('<Configure>', self.on_canvas_configure)
         
         # Enable drag and drop
-        self.canvas.drop_target_register('DND_Files')
-        self.canvas.dnd_bind('<<Drop>>', self.on_drop)
+        try:
+            self.canvas.drop_target_register('DND_Files')
+            self.canvas.dnd_bind('<<Drop>>', self.on_drop)
+        except:
+            # Fallback for systems without proper drag-drop support
+            pass
         
         # Info panel
         info_frame = ttk.LabelFrame(content_frame, text="Panorama Info", padding=10)
@@ -168,6 +177,11 @@ class SphericalPanoramaViewer:
         self.has_content = False
         self.update_info("Panorama initialized\nSize: {}x{}\nImages: 0".format(
             self.panorama_width, self.panorama_height))
+        
+    def on_canvas_configure(self, event):
+        """Handle canvas resize"""
+        self.canvas_ready = True
+        self.root.after_idle(self.redraw)
         
     def clear_panorama(self):
         """Clear the panorama"""
@@ -407,7 +421,20 @@ class SphericalPanoramaViewer:
         
     def redraw(self):
         """Redraw the current view"""
+        if not self.canvas_ready:
+            return
+            
         try:
+            # Get canvas dimensions
+            canvas_width = self.canvas.winfo_width()
+            canvas_height = self.canvas.winfo_height()
+            
+            # Skip if canvas not properly initialized
+            if canvas_width <= 1 or canvas_height <= 1:
+                self.root.after(100, self.redraw)
+                return
+            
+            # Extract current view
             view_img = self.extract_view()
             
             # Convert BGR to RGB
@@ -417,18 +444,14 @@ class SphericalPanoramaViewer:
             pil_img = Image.fromarray(view_img_rgb)
             
             # Resize to canvas size
-            canvas_width = self.canvas.winfo_width()
-            canvas_height = self.canvas.winfo_height()
+            pil_img = pil_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
             
-            if canvas_width > 1 and canvas_height > 1:
-                pil_img = pil_img.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
-            
-            # Convert to PhotoImage
-            self.photo = ImageTk.PhotoImage(pil_img)
+            # Convert to PhotoImage and store reference
+            self.current_photo = ImageTk.PhotoImage(pil_img)
             
             # Clear canvas and draw image
             self.canvas.delete("all")
-            self.canvas.create_image(canvas_width//2, canvas_height//2, image=self.photo)
+            self.canvas.create_image(canvas_width//2, canvas_height//2, image=self.current_photo)
             
             # Draw crosshairs
             self.canvas.create_line(canvas_width//2 - 10, canvas_height//2, 
@@ -438,8 +461,18 @@ class SphericalPanoramaViewer:
                                   canvas_width//2, canvas_height//2 + 10, 
                                   fill='red', width=2)
             
+            # Draw view info
+            info_text = f"Yaw: {self.yaw:.1f}°  Pitch: {self.pitch:.1f}°  FOV: {self.fov:.1f}°"
+            self.canvas.create_text(10, 10, text=info_text, anchor=tk.NW, fill='white', 
+                                  font=('Arial', 10))
+            
         except Exception as e:
             print(f"Redraw error: {e}")
+            # Fallback: show error message on canvas
+            self.canvas.delete("all")
+            self.canvas.create_text(canvas_width//2, canvas_height//2, 
+                                  text=f"Rendering error:\n{str(e)}", 
+                                  fill='red', font=('Arial', 12), justify=tk.CENTER)
     
     def save_panorama(self):
         """Save current panorama to file"""
@@ -507,14 +540,20 @@ def main():
     # Try to enable drag and drop
     try:
         from tkinterdnd2 import TkinterDnD
+        root.destroy()  # Destroy the regular Tk instance
         root = TkinterDnD.Tk()
+        print("Drag-and-drop enabled")
     except ImportError:
-        print("Warning: tkinterdnd2 not available, drag-and-drop may not work")
+        print("Warning: tkinterdnd2 not available, using file dialog only")
         
     app = SphericalPanoramaViewer(root)
     
-    # Initial draw
-    root.after(100, app.redraw)
+    # Wait for UI to be ready, then initial draw
+    def delayed_draw():
+        app.canvas_ready = True
+        app.redraw()
+    
+    root.after(500, delayed_draw)
     
     try:
         root.mainloop()

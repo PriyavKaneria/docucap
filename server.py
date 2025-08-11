@@ -13,7 +13,8 @@ import stitching_logic
 
 # --- Configuration ---
 ESP_IPS = {
-    '1': '192.168.137.152',
+    '1': '192.168.137.147',
+    # '1': '192.168.137.152',
     '2': '192.168.137.193',
     '3': '192.168.137.129'
 }
@@ -190,7 +191,7 @@ async def handle_start_live_calibration():
         os.makedirs(CALIBRATION_RUN_DIR, exist_ok=True)
         
         shared_state["live_stitchers"] = {
-            esp_id: stitching_logic.LiveIncrementalStitcher() for esp_id in ESP_IPS
+            esp_id: stitching_logic.MemoryEfficientStitcher() for esp_id in ESP_IPS
         }
         shared_state["is_live_calibrating"] = True
         
