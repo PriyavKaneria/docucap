@@ -25,6 +25,9 @@ volatile bool streaming_active = false;
 camera_config_t config;
 bool camera_initialized = false;
 
+// Thresholds
+const size_t WS_MAX_SAFE_SIZE = 200000; // if fb->len <= this, send via websocket in one frame
+
 void setupOptimalCamera() {
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -48,94 +51,56 @@ void setupOptimalCamera() {
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
-  Serial.printf("PSRAM found: %s\n", psramFound() ? "YES" : "NO");
-  Serial.printf("Free DRAM: %d bytes\n", ESP.getFreeHeap());
-  Serial.printf("Largest free DRAM block: %d bytes\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-
   if (psramFound()) {
-    Serial.println("PSRAM detected - using enhanced settings");
     config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.frame_size = FRAMESIZE_UXGA;  // 1600x1200
-    config.jpeg_quality = 4;             // Higher quality with PSRAM
+    config.frame_size = FRAMESIZE_SVGA;  // reasonable default
+    config.jpeg_quality = 8;             // 0..63, lower is better quality
     config.fb_count = 2;
     config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
-    Serial.println("No PSRAM - using conservative DRAM settings");
     config.fb_location = CAMERA_FB_IN_DRAM;
-
-    // Check available memory and adjust accordingly
-    size_t free_dram = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-
-    Serial.printf("Available DRAM: %d, Largest block: %d\n", free_dram, largest_block);
-
-    // Progressive fallback based on available memory
-    if (largest_block > 200000) {
-      // Try SXGA first
-      config.frame_size = FRAMESIZE_SXGA;  // 1280x1024
-      config.jpeg_quality = 8;
-    } else if (largest_block > 150000) {
-      // Fall back to XGA
-      config.frame_size = FRAMESIZE_XGA;  // 1024x768
-      config.jpeg_quality = 8;
-    } else if (largest_block > 100000) {
-      // Fall back to SVGA
-      config.frame_size = FRAMESIZE_SVGA;  // 800x600
-      config.jpeg_quality = 10;
-    } else {
-      // Last resort - VGA
-      config.frame_size = FRAMESIZE_VGA;  // 640x480
-      config.jpeg_quality = 12;
-    }
-
-    config.fb_count = 1;  // Single frame buffer only
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
   }
-
-  Serial.printf("Selected frame size: %d, quality: %d\n", config.frame_size, config.jpeg_quality);
 }
 
 bool initCamera() {
   if (camera_initialized) return true;
-  Serial.println(config.fb_location);
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x\n", err);
     return false;
   }
 
-  // Fine-tune camera settings for best quality
   sensor_t *s = esp_camera_sensor_get();
   if (s != NULL) {
-    // Optimize image quality settings
-    s->set_brightness(s, 0);                  // -2 to 2
-    s->set_contrast(s, 0);                    // -2 to 2
-    s->set_saturation(s, 0);                  // -2 to 2
-    s->set_special_effect(s, 0);              // 0 to 6 (0-No Effect, 1-Negative, 2-Grayscale, 3-Red Tint, 4-Green Tint, 5-Blue Tint, 6-Sepia)
-    s->set_whitebal(s, 1);                    // 0 = disable , 1 = enable
-    s->set_awb_gain(s, 1);                    // 0 = disable , 1 = enable
-    s->set_wb_mode(s, 0);                     // 0 to 4 - if awb_gain enabled (0 - Auto, 1 - Sunny, 2 - Cloudy, 3 - Office, 4 - Home)
-    s->set_exposure_ctrl(s, 1);               // 0 = disable , 1 = enable
-    s->set_aec2(s, 0);                        // 0 = disable , 1 = enable
-    s->set_ae_level(s, 0);                    // -2 to 2
-    s->set_aec_value(s, 300);                 // 0 to 1200
-    s->set_gain_ctrl(s, 1);                   // 0 = disable , 1 = enable
-    s->set_agc_gain(s, 0);                    // 0 to 30
-    s->set_gainceiling(s, (gainceiling_t)0);  // 0 to 6
-    s->set_bpc(s, 0);                         // 0 = disable , 1 = enable
-    s->set_wpc(s, 1);                         // 0 = disable , 1 = enable
-    s->set_raw_gma(s, 1);                     // 0 = disable , 1 = enable
-    s->set_lenc(s, 1);                        // 0 = disable , 1 = enable
-    s->set_hmirror(s, 0);                     // 0 = disable , 1 = enable
-    s->set_vflip(s, 0);                       // 0 = disable , 1 = enable
-    s->set_dcw(s, 1);                         // 0 = disable , 1 = enable
-    s->set_colorbar(s, 0);                    // 0 = disable , 1 = enable
-
-    Serial.println("Camera sensor configured for optimal quality");
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+    s->set_special_effect(s, 0);
+    s->set_whitebal(s, 1);
+    s->set_awb_gain(s, 1);
+    s->set_wb_mode(s, 0);
+    s->set_exposure_ctrl(s, 1);
+    s->set_aec2(s, 0);
+    s->set_ae_level(s, 0);
+    s->set_aec_value(s, 300);
+    s->set_gain_ctrl(s, 1);
+    s->set_agc_gain(s, 0);
+    s->set_gainceiling(s, (gainceiling_t)0);
+    s->set_bpc(s, 0);
+    s->set_wpc(s, 1);
+    s->set_raw_gma(s, 1);
+    s->set_lenc(s, 1);
+    s->set_hmirror(s, 0);
+    s->set_vflip(s, 0);
+    s->set_dcw(s, 1);
+    s->set_colorbar(s, 0);
   }
 
   camera_initialized = true;
-  Serial.printf("Camera initialized successfully at %dx%d, quality=%d\n",
-                config.frame_size, config.frame_size, config.jpeg_quality);
+  Serial.printf("Camera initialized successfully (framesize=%d, quality=%d)\n", config.frame_size, config.jpeg_quality);
   return true;
 }
 
@@ -146,32 +111,24 @@ void deinitCamera() {
   Serial.println("Camera deinitialized");
 }
 
-// Method 1: WebSocket with chunked sending for large images
-void sendImageViaWebSocket(camera_fb_t *fb) {
+// Send image over websocket in one binary frame (if small enough)
+void sendImageViaWebSocketSingle(camera_fb_t *fb) {
   if (!ws || ws->count() == 0) return;
 
-  const size_t chunk_size = 1024;  // Send in 1KB chunks to avoid memory issues
-  size_t remaining = fb->len;
-  uint8_t *data = fb->buf;
-
-  // Send image size first
-  String header = "IMG:" + String(fb->len);
-  ws->textAll(header);
-  delay(10);  // Small delay to ensure header is received first
-
-  // Send image data in chunks
-  while (remaining > 0) {
-    size_t to_send = (remaining > chunk_size) ? chunk_size : remaining;
-    ws->binaryAll(data, to_send);
-    data += to_send;
-    remaining -= to_send;
-    delay(1);  // Small delay between chunks
-  }
-
-  Serial.printf("Sent %d bytes via WebSocket in chunks\n", fb->len);
+  // Single binary frame
+  ws->binaryAll(fb->buf, fb->len);
+  Serial.printf("Sent %d bytes via WebSocket (single frame)\n", fb->len);
 }
 
-// Method 2: HTTP endpoint for direct image download (often better for high quality)
+// Fallback: if too large, instruct client to fetch via HTTP GET /capture?ts=...
+void sendImageViaHTTPNotify(camera_fb_t *fb) {
+  if (!ws || ws->count() == 0) return;
+  // Create a short notification with a timestamped URL
+  String url = "/capture?ts=" + String(millis());
+  ws->textAll("HTTP:" + url);
+  Serial.printf("Notified clients to fetch via HTTP: %s (size=%d)\n", url.c_str(), fb->len);
+}
+
 void setupImageEndpoint() {
   server->on("/capture", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!initCamera()) {
@@ -185,7 +142,6 @@ void setupImageEndpoint() {
       return;
     }
 
-    // Send image with proper headers
     AsyncWebServerResponse *response = request->beginResponse_P(
       200,
       "image/jpeg",
@@ -197,7 +153,7 @@ void setupImageEndpoint() {
 
     // Add timestamp header
     char ts[32];
-    snprintf(ts, 32, "%lld.%06ld", fb->timestamp.tv_sec, fb->timestamp.tv_usec);
+    snprintf(ts, 32, "%llu", (unsigned long long)millis());
     response->addHeader("X-Timestamp", ts);
 
     request->send(response);
@@ -207,7 +163,6 @@ void setupImageEndpoint() {
   });
 }
 
-// Method 3: MJPEG Stream endpoint (for continuous viewing)
 void setupStreamEndpoint() {
   server->on("/stream", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!initCamera()) {
@@ -219,8 +174,8 @@ void setupStreamEndpoint() {
       "multipart/x-mixed-replace; boundary=frame",
       [](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
         static camera_fb_t *fb = nullptr;
-        static bool boundary_sent = false;
         static size_t fb_index = 0;
+        static bool boundary_sent = false;
 
         if (!boundary_sent) {
           const char *boundary = "\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n";
@@ -247,7 +202,8 @@ void setupStreamEndpoint() {
           esp_camera_fb_return(fb);
           fb = nullptr;
           boundary_sent = false;
-          delay(100);  // Control frame rate - adjust as needed
+          // small delay to control frame rate
+          delay(100);
         }
 
         return to_send;
@@ -282,20 +238,63 @@ void captureTask(void *pvParameters) {
       Serial.printf("Captured: %dx%d, %d bytes, quality=%d\n",
                     fb->width, fb->height, fb->len, config.jpeg_quality);
 
-      // Send via WebSocket if clients connected
-      if (ws && ws->count() > 0) {
-        sendImageViaWebSocket(fb);
+      // Choose transport based on size
+      if (fb->len <= WS_MAX_SAFE_SIZE) {
+        sendImageViaWebSocketSingle(fb);
+      } else {
+        // large image -> instruct client to fetch via HTTP
+        sendImageViaHTTPNotify(fb);
       }
 
       esp_camera_fb_return(fb);
       digitalWrite(LED_PIN, HIGH);  // LED off
     }
 
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
 
-void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+void handleWsCommand(const String &msg) {
+  if (msg == "init") {
+    initCamera();
+  } else if (msg == "capture") {
+    capture_requested = true;
+  } else if (msg == "deinit") {
+    deinitCamera();
+  } else if (msg == "sleep") {
+    // For safety: deinit camera and disconnect WiFi for low power.
+    // Deep sleep would require wake source planning; so we do software sleep.
+    deinitCamera();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    Serial.println("Entered low-power software sleep: camera deinitialized, WiFi off");
+  } else if (msg.startsWith("quality:")) {
+    int quality = msg.substring(8).toInt();
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+      s->set_quality(s, quality);
+      Serial.printf("Quality set to %d\n", quality);
+    }
+  } else if (msg.startsWith("framesize:")) {
+    String sizeStr = msg.substring(10);
+    framesize_t framesize;
+
+    if (sizeStr == "UXGA") framesize = FRAMESIZE_UXGA;
+    else if (sizeStr == "SXGA") framesize = FRAMESIZE_SXGA;
+    else if (sizeStr == "XGA") framesize = FRAMESIZE_XGA;
+    else if (sizeStr == "SVGA") framesize = FRAMESIZE_SVGA;
+    else if (sizeStr == "VGA") framesize = FRAMESIZE_VGA;
+    else return;
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+      s->set_framesize(s, framesize);
+      Serial.printf("Frame size set to %s\n", sizeStr.c_str());
+    }
+  }
+}
+
+void onWsEvent(AsyncWebSocket *serverWs, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_CONNECT) {
     Serial.printf("WebSocket client #%u connected\n", client->id());
   } else if (type == WS_EVT_DISCONNECT) {
@@ -303,42 +302,10 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
   } else if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo *)arg;
     if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
-      data[len] = 0;
-      String msg = (char *)data;
+      // Text message command
+      String msg = String((char *)data);
       Serial.printf("Received command: %s\n", msg.c_str());
-
-      if (msg == "capture") {
-        capture_requested = true;
-      } else if (msg == "wake_camera") {
-        initCamera();
-      } else if (msg == "sleep_camera") {
-        deinitCamera();
-      } else if (msg.startsWith("quality:")) {
-        int quality = msg.substring(8).toInt();
-        if (quality >= 0 && quality <= 63) {
-          sensor_t *s = esp_camera_sensor_get();
-          if (s) {
-            s->set_quality(s, quality);
-            Serial.printf("Quality set to %d\n", quality);
-          }
-        }
-      } else if (msg.startsWith("framesize:")) {
-        String sizeStr = msg.substring(10);
-        framesize_t framesize;
-
-        if (sizeStr == "UXGA") framesize = FRAMESIZE_UXGA;
-        else if (sizeStr == "SXGA") framesize = FRAMESIZE_SXGA;
-        else if (sizeStr == "XGA") framesize = FRAMESIZE_XGA;
-        else if (sizeStr == "SVGA") framesize = FRAMESIZE_SVGA;
-        else if (sizeStr == "VGA") framesize = FRAMESIZE_VGA;
-        else return;
-
-        sensor_t *s = esp_camera_sensor_get();
-        if (s) {
-          s->set_framesize(s, framesize);
-          Serial.printf("Frame size set to %s\n", sizeStr.c_str());
-        }
-      }
+      handleWsCommand(msg);
     }
   }
 }
@@ -348,25 +315,21 @@ void setup() {
   Serial.setDebugOutput(true);
 
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  digitalWrite(LED_PIN, HIGH); // LED off (active low)
 
-  Serial.println("Starting ESP32-CAM High Quality Capture");
+  Serial.println("Starting ESP32-CAM Optimized Server");
 
-  // Setup camera configuration
   setupOptimalCamera();
 
-  // Initialize camera early
-  if (!initCamera()) {
-    Serial.println("CRITICAL: Camera initialization failed!");
-  }
-
   // WiFi connection
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     digitalWrite(LED_PIN, LOW);
-    delay(500);
+    delay(200);
     digitalWrite(LED_PIN, HIGH);
+    delay(200);
     Serial.print(".");
   }
   Serial.println();
@@ -376,140 +339,131 @@ void setup() {
   // Create web server
   server = new AsyncWebServer(80);
   ws = new AsyncWebSocket("/ws");
-
   ws->onEvent(onWsEvent);
   server->addHandler(ws);
 
-  // Setup different capture methods
-  setupImageEndpoint();   // HTTP GET /capture
-  setupStreamEndpoint();  // HTTP GET /stream
+  setupImageEndpoint();
+  setupStreamEndpoint();
 
-  // Simple web interface
+  // Serve improved client HTML/JS
   server->on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String html = R"(
+    String html = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
-    <title>ESP32-CAM High Quality Capture</title>
-    <style>
-        body { font-family: Arial; margin: 20px; }
-        button { padding: 10px 20px; margin: 10px; font-size: 16px; }
-        img { max-width: 100%; border: 1px solid #ccc; }
-        .controls { margin: 20px 0; }
-    </style>
+  <meta charset="utf-8">
+  <title>ESP32-CAM Optimized Interface</title>
+  <style>body{font-family:Arial;margin:10px;}button{margin:4px;padding:8px}</style>
 </head>
 <body>
-    <h1>ESP32-CAM High Quality Capture</h1>
-    
-    <div class=\"controls\">
-        <button onclick=\"captureImage()\">Capture High Quality Image</button>
-        <button onclick=\"downloadImage()\">Download Latest Image</button>
-        <button onclick=\"startStream()\">Start MJPEG Stream</button>
-        <button onclick=\"stopStream()\">Stop Stream</button>
-    </div>
-    
-    <div class=\"controls\">
-        Quality: <select id=\"quality\" onchange=\"setQuality()\">
-            <option value=\"0\">Highest (0)</option>
-            <option value=\"4\">High (4)</option>
-            <option value=\"6\" selected>Good (6)</option>
-            <option value=\"10\">Medium (10)</option>
-            <option value=\"15\">Low (15)</option>
-        </select>
-        
-        Size: <select id=\"framesize\" onchange=\"setFrameSize()\">
-            <option value=\"UXGA\" selected>UXGA (1600x1200)</option>
-            <option value=\"SXGA\">SXGA (1280x1024)</option>
-            <option value=\"XGA\">XGA (1024x768)</option>
-            <option value=\"SVGA\">SVGA (800x600)</option>
-            <option value=\"VGA\">VGA (640x480)</option>
-        </select>
-    </div>
-    
-    <div id=\"imageContainer\">
-        <img id=\"capturedImage\" style=\"display:none;\">
-        <img id=\"streamImage\" style=\"display:none;\">
-    </div>
-    
-    <div id=\"status\"></div>
+  <h2>ESP32-CAM Optimized</h2>
+  <div>
+    <button onclick="wsSend('init')">Init Camera</button>
+    <button onclick="wsSend('capture')">Capture</button>
+    <button onclick="wsSend('deinit')">Deinit Camera</button>
+    <button onclick="wsSend('sleep')">Low-Power Sleep (soft)</button>
+  </div>
 
-    <script>
-        const ws = new WebSocket('ws://' + window.location.host + '/ws');
-        let imageData = [];
-        let expectedSize = 0;
-        
-        ws.onmessage = function(event) {
-            if (typeof event.data === 'string' && event.data.startsWith('IMG:')) {
-                expectedSize = parseInt(event.data.split(':')[1]);
-                imageData = [];
-                document.getElementById('status').textContent = 'Receiving image: ' + expectedSize + ' bytes...';
-            } else if (event.data instanceof Blob) {
-                event.data.arrayBuffer().then(buffer => {
-                    imageData.push(new Uint8Array(buffer));
-                    
-                    let totalReceived = imageData.reduce((sum, chunk) => sum + chunk.length, 0);
-                    if (totalReceived >= expectedSize) {
-                        displayReceivedImage();
-                    }
-                });
-            }
-        };
-        
-        function displayReceivedImage() {
-            let totalSize = imageData.reduce((sum, chunk) => sum + chunk.length, 0);
-            let fullImage = new Uint8Array(totalSize);
-            let offset = 0;
-            
-            for (let chunk of imageData) {
-                fullImage.set(chunk, offset);
-                offset += chunk.length;
-            }
-            
-            let blob = new Blob([fullImage], {type: 'image/jpeg'});
-            let url = URL.createObjectURL(blob);
-            
-            let img = document.getElementById('capturedImage');
-            img.src = url;
-            img.style.display = 'block';
-            
-            document.getElementById('status').textContent = 'Image received: ' + totalSize + ' bytes';
-        }
-        
-        function captureImage() {
-            ws.send('capture');
-            document.getElementById('status').textContent = 'Capturing...';
-        }
-        
-        function downloadImage() {
-            window.open('/capture', '_blank');
-        }
-        
-        function startStream() {
-            let img = document.getElementById('streamImage');
-            img.src = '/stream';
-            img.style.display = 'block';
-            document.getElementById('capturedImage').style.display = 'none';
-        }
-        
-        function stopStream() {
-            let img = document.getElementById('streamImage');
-            img.src = '';
-            img.style.display = 'none';
-        }
-        
-        function setQuality() {
-            let quality = document.getElementById('quality').value;
-            ws.send('quality:' + quality);
-        }
-        
-        function setFrameSize() {
-            let framesize = document.getElementById('framesize').value;
-            ws.send('framesize:' + framesize);
-        }
-    </script>
+  <div style="margin-top:8px">
+    Quality: <select id="quality" onchange="setQuality()">
+      <option value="4">4 (high)</option>
+      <option value="6" selected>6 (good)</option>
+      <option value="10">10 (medium)</option>
+      <option value="15">15 (low)</option>
+    </select>
+
+    Size: <select id="framesize" onchange="setFrameSize()">
+      <option value="UXGA">UXGA</option>
+      <option value="SXGA">SXGA</option>
+      <option value="XGA">XGA</option>
+      <option value="SVGA" selected>SVGA</option>
+      <option value="VGA">VGA</option>
+    </select>
+  </div>
+
+  <div id="status" style="margin-top:8px">Status: idle</div>
+  <div style="margin-top:8px"><img id="img" style="max-width:100%;border:1px solid #ccc;display:block"></div>
+  <div id="timing"></div>
+
+<script>
+  const ws = new WebSocket('ws://' + window.location.host + '/ws');
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => { document.getElementById('status').innerText = 'WS connected'; };
+  ws.onclose = () => { document.getElementById('status').innerText = 'WS closed'; };
+  ws.onerror = (e) => { document.getElementById('status').innerText = 'WS error'; };
+
+  let lastCaptureStart = 0;
+
+  ws.onmessage = function(event) {
+    if (typeof event.data === 'string') {
+      const txt = event.data;
+      if (txt.startsWith('HTTP:')) {
+        // server asks us to fetch via HTTP
+        const url = txt.substring(5);
+        fetchImage(url);
+      } else {
+        document.getElementById('status').innerText = 'MSG: ' + txt;
+      }
+      return;
+    }
+
+    // Binary ArrayBuffer received -> complete image (we send single binary frame)
+    const receiveTime = performance.now();
+    const delta = (receiveTime - lastCaptureStart).toFixed(1);
+
+    const arrayBuffer = event.data;
+    const blob = new Blob([arrayBuffer], {type: 'image/jpeg'});
+    const url = URL.createObjectURL(blob);
+    const img = document.getElementById('img');
+    img.onload = () => { URL.revokeObjectURL(url); };
+    img.src = url;
+
+    document.getElementById('status').innerText = 'Image received: ' + blob.size + ' bytes';
+    document.getElementById('timing').innerText = 'Request→Complete: ' + delta + ' ms';
+  };
+
+  function fetchImage(path) {
+    lastCaptureStart = performance.now();
+    document.getElementById('status').innerText = 'Fetching via HTTP: ' + path;
+    fetch(path).then(resp => resp.blob()).then(blob => {
+      const receiveTime = performance.now();
+      const delta = (receiveTime - lastCaptureStart).toFixed(1);
+      const url = URL.createObjectURL(blob);
+      const img = document.getElementById('img');
+      img.onload = () => { URL.revokeObjectURL(url); };
+      img.src = url;
+      document.getElementById('status').innerText = 'Image fetched HTTP: ' + blob.size + ' bytes';
+      document.getElementById('timing').innerText = 'Request→Complete: ' + delta + ' ms';
+    }).catch(err => {
+      document.getElementById('status').innerText = 'HTTP fetch failed';
+    });
+  }
+
+  function wsSend(msg) {
+    if (ws.readyState === WebSocket.OPEN) {
+      if (msg === 'capture') {
+        lastCaptureStart = performance.now();
+      }
+      ws.send(msg);
+    } else {
+      alert('WebSocket not open');
+    }
+  }
+
+  function setQuality() {
+    const q = document.getElementById('quality').value;
+    wsSend('quality:' + q);
+  }
+
+  function setFrameSize() {
+    const s = document.getElementById('framesize').value;
+    wsSend('framesize:' + s);
+  }
+</script>
 </body>
 </html>
-)";
+)rawliteral";
     request->send(200, "text/html", html);
   });
 
