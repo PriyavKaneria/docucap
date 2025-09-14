@@ -18,6 +18,7 @@ import subprocess
 from datetime import datetime
 from typing import Dict, Optional
 import platform
+import socket
 
 
 from rich.table import Table
@@ -86,6 +87,15 @@ def parse_arp(out: str):
     return devices
 
 
+def get_local_ip_for_target(target_ip: str) -> str:
+    """Get the local IP that would be used to reach target_ip"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((target_ip, 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "unknown"
+
 def ping_once(ip: str, timeout: float = 1.0) -> bool:
     system = platform.system().lower()
     if system == "windows":
@@ -93,7 +103,14 @@ def ping_once(ip: str, timeout: float = 1.0) -> bool:
     else:
         cmd = ["ping", "-c", "1", "-W", str(int(timeout)), ip]
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout + 0.5)
+        # Debug: show which local IP we're using
+        local_ip = get_local_ip_for_target(ip)
+        # print(f"DEBUG: Pinging {ip} from local IP {local_ip}")
+        
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                            timeout=timeout + 0.5, text=True)
+        # if proc.returncode != 0:
+            # print(f"DEBUG: Ping failed - stdout: {proc.stdout}, stderr: {proc.stderr}")
         return proc.returncode == 0
     except Exception:
         return False
