@@ -44,8 +44,8 @@ ESP_WS_PATHS = ["/ws", "/socket", "/ws/"]
 # static ESP_IPS and dynamic ARP mapping heuristics.
 ESP_MACS = {
     "1": "c82e18255950",
-    "2": "c82e1824f7dc",
-    "3": "c82e1823124c",
+    "2": "c82e1823124c",
+    "3": "c82e1824f7dc",
     "4": "c82e18257ac8",
 }
 # Internal resolved map id -> mac
@@ -356,7 +356,7 @@ async def handle_esp_binary_message(esp_id: str, image_data: bytes):
         if state["is_live_calibrating"]:
             # Save all frames to rotation sweep dir
             ts = datetime.now().timestamp()
-            out_path = CALIBRATION_RUN_DIR / f"{int(ts*1000)}_esp_{esp_id}.jpg"
+            out_path = CALIBRATION_RUN_DIR / f"esp_{esp_id}_{int(ts*1000)}.jpg"
             CALIBRATION_RUN_DIR.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(out_path), frame)
         elif state["is_capturing_anchors"]:
