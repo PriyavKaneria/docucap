@@ -30,6 +30,7 @@
 import os
 from pathlib import Path
 from typing import List, Tuple
+import time
 
 import numpy as np
 import cv2 as cv
@@ -217,6 +218,19 @@ def create_detector(kind: str, nfeatures: int):
             raise RuntimeError("SIFT not available in this OpenCV build") from e
     raise ValueError(f"Unknown detector: {kind}")
 
+def fallback_feature_detection(imgA, imgB, detector_kind='orb', nfeatures=10000):
+    detector = create_detector(detector_kind, nfeatures)
+    kpsA, descA = detector.detectAndCompute(imgA, None)
+    kpsB, descB = detector.detectAndCompute(imgB, None)
+
+    # Ensure descriptors are valid
+    if descA is None or descA.size == 0:
+        descA = np.zeros((0, 32 if detector_kind.lower() != 'sift' else 128), dtype=np.uint8 if detector_kind.lower() != 'sift' else np.float32)
+    if descB is None or descB.size == 0:
+        descB = np.zeros((0, 32 if detector_kind.lower() != 'sift' else 128), dtype=np.uint8 if detector_kind.lower() != 'sift' else np.float32)
+
+    return kpsA, descA, kpsB, descB
+
 detector = create_detector(DETECTOR, N_FEATURES)
 
 all_kps: List[List[cv.KeyPoint]] = []
@@ -369,7 +383,7 @@ if USE_SPHERICAL:
 
 # %%
 # Step controls and runtime options
-CUR_I = 1  # 1..len(work_imgs)-1 (subset will be images [0..CUR_I])
+CUR_I = 0  # 1..len(work_imgs)-1 (subset will be images [0..CUR_I])
 RANGE_WIDTH = 1  # match only neighbors for stability
 CONF_THRESH_MATCHES = 0.3  # subset connectivity threshold
 ADJ_THRESHOLDS = (0.3, 0.0)  # fallback thresholds for CameraAdjuster
@@ -379,6 +393,12 @@ RUN_EXPOSURE_COMP = True
 # Shared debug state dict, populated by the following cells
 STATE = {}
 
+# %% [markdown]
+# ## Run the next steps again and again
+
+# %%
+CUR_I += 1
+
 # %%
 # 1) Compute pairwise matches for the current subset and show confidence matrix
 matcher_debug = FeatureMatcher(matcher_type="homography", range_width=RANGE_WIDTH)
@@ -387,19 +407,86 @@ subset_imgs = work_imgs[:CUR_I+1]
 subset_feats = features_stitch[:CUR_I+1]
 
 matches_dbg = matcher_debug.match_features(subset_feats)
+
 conf_matrix = matcher_debug.get_confidence_matrix(matches_dbg)
+time.sleep(0.01)
+print("conf_matrix after get_confidence_matrix:", conf_matrix)
 
 print("Confidence matrix shape:", conf_matrix.shape)
 np.set_printoptions(precision=3, suppress=True, linewidth=160)
 print(conf_matrix)
 
 # Neighbor confidences (k=1 diagonal) – useful for sequential merges
+neighbor_conf = None
 if conf_matrix.shape[0] > 1:
     neighbor_conf = np.diag(conf_matrix, k=1)
     print("Neighbor confidences (k=1 diagonal):", neighbor_conf)
     print("Min neighbor confidence:", float(np.min(neighbor_conf)))
 
-# Visualize confidence matrix as heatmap with values
+# --- Fallback if the latest neighbor has low confidence ---
+if CUR_I >= 1:
+    cur_conf = float(conf_matrix[CUR_I-1, CUR_I])
+    print(f"Confidence for neighbor pair ({CUR_I-1},{CUR_I}): {cur_conf:.3f}")
+    if cur_conf < 0.8:  # threshold for fallback, lowered to catch more cases
+        print(f"Low confidence detected for frame {CUR_I}. Running extensive fallback alignment...")
+
+        imgA, imgB = subset_imgs[CUR_I-1], subset_imgs[CUR_I]
+        grayA, grayB = cv.cvtColor(imgA, cv.COLOR_BGR2GRAY), cv.cvtColor(imgB, cv.COLOR_BGR2GRAY)
+
+        # Re-detect features with higher count for better matching
+        kpsA, descA, kpsB, descB = fallback_feature_detection(grayA, grayB, DETECTOR, nfeatures=10000)
+
+        if (descA is not None and descA.shape[0] > 0 and descB is not None and descB.shape[0] > 0 and
+            descA.shape[1] == descB.shape[1] and descA.dtype == descB.dtype):
+            norm = cv.NORM_L2 if DETECTOR.lower() == "sift" else cv.NORM_HAMMING
+            bf = cv.BFMatcher(norm, crossCheck=False)
+
+            try:
+                # Use KNN for better matching with ratio test
+                knn_matches = bf.knnMatch(descA, descB, k=2)
+                good_matches = []
+                for m in knn_matches:
+                    if len(m) == 2:
+                        m1, m2 = m
+                        if m1.distance < 0.75 * m2.distance:
+                            good_matches.append(m1)
+                    elif len(m) == 1:
+                        good_matches.append(m[0])
+
+                if len(good_matches) >= 4:
+                    ptsA = np.float32([kpsA[m.queryIdx].pt for m in good_matches])
+                    ptsB = np.float32([kpsB[m.trainIdx].pt for m in good_matches])
+                    H, inliers = cv.findHomography(ptsA, ptsB, cv.RANSAC, 5.0)
+                    if H is not None and inliers.sum() >= 10:
+                        print(f"Fallback homography succeeded with {inliers.sum()} inliers.")
+                        # fabricate a MatchInfo-like object (minimal)
+                        m = matches_dbg[CUR_I-1]
+                        m.H = H
+                        m.num_inliers = int(inliers.sum())
+                        conf_matrix[CUR_I-1, CUR_I] = m.num_inliers / max(len(good_matches), 1)
+                    else:
+                        print("Homography fallback failed, trying ECC...")
+                        warp_matrix = np.eye(3, 3, dtype=np.float32)
+                        try:
+                            cc, warp_matrix = cv.findTransformECC(
+                                grayA, grayB, warp_matrix, cv.MOTION_HOMOGRAPHY,
+                                criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 5000, 1e-6)
+                            )
+                            print(f"ECC fallback succeeded (cc={cc:.4f}).")
+                            m = matches_dbg[CUR_I-1]
+                            m.H = warp_matrix
+                            m.num_inliers = 20  # fake count
+                            conf_matrix[CUR_I-1, CUR_I] = 0.5  # assign mid confidence
+                        except Exception as e:
+                            print("ECC fallback also failed:", e)
+                else:
+                    print("Not enough good matches after ratio test.")
+            except Exception as e:
+                print(f"BFMatcher failed in fallback: {e}")
+        else:
+            print("Descriptors missing or incompatible, cannot run fallback.")
+
+# Visualization of confidence matrix
 fig, ax = plt.subplots(figsize=(min(12, 2+2*conf_matrix.shape[0]), min(12, 2+2*conf_matrix.shape[1])))
 cax = ax.matshow(conf_matrix, interpolation='nearest')
 fig.colorbar(cax)
@@ -407,36 +494,6 @@ for (i, j), z in np.ndenumerate(conf_matrix):
     ax.text(j, i, f"{z:0.2f}", ha='center', va='center', fontsize=6, color="white" if z > 0.5 else "black")
 ax.set_title(f"Confidence matrix up to image {CUR_I}")
 plt.show()
-
-# Pairwise match visualization for the immediate previous pair (CUR_I-1, CUR_I) using OpenCV features
-if CUR_I >= 1:
-    kpsA, descA = all_kps[CUR_I-1], all_descs[CUR_I-1]
-    kpsB, descB = all_kps[CUR_I],   all_descs[CUR_I]
-    norm = cv.NORM_L2 if DETECTOR.lower() == "sift" else cv.NORM_HAMMING
-    if descA is None or len(descA) == 0 or descB is None or len(descB) == 0:
-        print("Insufficient pairwise descriptors for visualization; skipping pairwise plot.")
-    else:
-        bf = cv.BFMatcher(norm, crossCheck=True)
-        pair_matches = bf.match(descA, descB)
-        pair_matches = sorted(pair_matches, key=lambda m: m.distance)[:200]
-        vis = cv.drawMatches(subset_imgs[CUR_I-1], kpsA, subset_imgs[CUR_I], kpsB, pair_matches, None, matchColor=(0, 255, 0))
-        plot_image(vis, figsize=(16, 8), title=f"Pairwise matches (img {CUR_I} → {CUR_I+1})")
-
-# Also visualize inliers via Stitching API for the same neighbor pair and print its confidence
-try:
-    vis_entries = matcher_debug.draw_matches_matrix(
-        subset_imgs, subset_feats, matches_dbg,
-        conf_thresh=0.0, inliers=True, matchColor=(0, 255, 0)
-    )
-    for (ii, jj, vis_img) in vis_entries:
-        if ii == CUR_I-1 and jj == CUR_I:
-            plot_image(vis_img, figsize=(16, 8), title=f"Stitching inliers (img {CUR_I} → {CUR_I+1})")
-            break
-except Exception as e:
-    print("draw_matches_matrix failed:", e)
-
-if CUR_I >= 1 and conf_matrix.shape[0] > CUR_I and conf_matrix.shape[1] > CUR_I:
-    print(f"Confidence for neighbor pair ({CUR_I-1},{CUR_I}):", float(conf_matrix[CUR_I-1, CUR_I]))
 
 # Save interim to STATE
 STATE.update({
@@ -475,17 +532,29 @@ adjusted_ok = False
 last_error = None
 for th in ADJ_THRESHOLDS:
     try:
-        camera_adjuster_dbg = CameraAdjuster(confidence_threshold=th)
+        camera_adjuster_dbg = CameraAdjuster(confidence_threshold=th, adjuster="ray")
         cameras_dbg = camera_adjuster_dbg.adjust(subset_feats, matches_dbg, cameras_dbg)
         adjusted_ok = True
-        print(f"CameraAdjuster succeeded at confidence_threshold={th}")
+        print(f"CameraAdjuster (ray) succeeded at confidence_threshold={th}")
         break
     except Exception as e:
         last_error = e
-        print(f"Adjuster failed at confidence_threshold={th}: {e}")
+        print(f"Ray adjuster failed at confidence_threshold={th}: {e}")
 
+# Fallback reprojection adjuster
 if not adjusted_ok:
-    raise RuntimeError(f"Camera adjusting failed. Last error: {last_error}")
+    try:
+        camera_adjuster_dbg = CameraAdjuster(confidence_threshold=1e-5, adjuster="reproj")
+        cameras_dbg = camera_adjuster_dbg.adjust(subset_feats, matches_dbg, cameras_dbg)
+        adjusted_ok = True
+        print("CameraAdjuster (reproj) fallback succeeded")
+    except Exception as e:
+        last_error = e
+        print(f"Reproj adjuster also failed: {e}")
+
+# Final fallback
+if not adjusted_ok:
+    print(f"WARNING: Camera adjustment failed, keeping raw estimates. Last error: {last_error}")
 
 wave_corrector_dbg = WaveCorrector()
 cameras_dbg = wave_corrector_dbg.correct(cameras_dbg)
@@ -551,6 +620,25 @@ cv.imwrite(out_path, panorama_dbg)
 print(f"Saved spherical panorama for step {CUR_I}: {out_path}")
 
 STATE.update({
+    "warped_imgs": warped_imgs,
+    "warped_masks": warped_masks,
+    "corners": corners,
+    "sizes_out": sizes_out,
+    "seam_masks": seam_masks,
+    "compensated_imgs": compensated_imgs,
+    "panorama_dbg": panorama_dbg,
+    "out_path": out_path,
+})
+
+# %% [markdown]
+# ##
+
+# %%
+print(CUR_I)
+
+# %%
+STATE_BKP = {}
+STATE_BKP.update({
     "warped_imgs": warped_imgs,
     "warped_masks": warped_masks,
     "corners": corners,
