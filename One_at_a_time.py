@@ -218,16 +218,29 @@ def create_detector(kind: str, nfeatures: int):
             raise RuntimeError("SIFT not available in this OpenCV build") from e
     raise ValueError(f"Unknown detector: {kind}")
 
+def convert_to_numpy(desc, detector_kind='orb'):
+    """Convert descriptor to numpy array, handling UMat objects"""
+    if desc is None:
+        return np.zeros((0, 32 if detector_kind.lower() != 'sift' else 128), dtype=np.uint8 if detector_kind.lower() != 'sift' else np.float32)
+
+    # Handle UMat objects
+    if hasattr(desc, 'get'):
+        desc = desc.get()
+
+    # Convert to numpy array if not already
+    if not isinstance(desc, np.ndarray):
+        desc = np.array(desc, dtype=np.uint8 if detector_kind.lower() != 'sift' else np.float32)
+
+    return desc
+
 def fallback_feature_detection(imgA, imgB, detector_kind='orb', nfeatures=10000):
     detector = create_detector(detector_kind, nfeatures)
     kpsA, descA = detector.detectAndCompute(imgA, None)
     kpsB, descB = detector.detectAndCompute(imgB, None)
 
-    # Ensure descriptors are valid
-    if descA is None or descA.size == 0:
-        descA = np.zeros((0, 32 if detector_kind.lower() != 'sift' else 128), dtype=np.uint8 if detector_kind.lower() != 'sift' else np.float32)
-    if descB is None or descB.size == 0:
-        descB = np.zeros((0, 32 if detector_kind.lower() != 'sift' else 128), dtype=np.uint8 if detector_kind.lower() != 'sift' else np.float32)
+    # Convert to numpy arrays
+    descA = convert_to_numpy(descA, detector_kind)
+    descB = convert_to_numpy(descB, detector_kind)
 
     return kpsA, descA, kpsB, descB
 
@@ -265,114 +278,279 @@ plot_images([k0, k1], titles=["Stitch feats img1", "Stitch feats last"], figsize
 
 # Spherical warping + camera estimation incremental pipeline (no upscaling; detect once)
 
-USE_SPHERICAL = False  # Set True to run automatic loop; manual step-by-step controls are provided below.
+USE_SPHERICAL = True  # Set True to run automatic loop; manual step-by-step controls are provided below.
 
 
 # %%
+
+def descriptors_norm(detector_kind: str):
+    # ORB/BRISK/AKAZE -> binary -> Hamming; SIFT -> float -> L2
+    if detector_kind.lower() in ("sift",):
+        return cv.NORM_L2
+    return cv.NORM_HAMMING
+
 if USE_SPHERICAL:
-    print("Running spherical incremental pipeline with camera estimation...")
+    print("Running INCREMENTAL spherical stitching pipeline...")
     matcher = FeatureMatcher(matcher_type="homography", range_width=1)
     camera_estimator = CameraEstimator()
     camera_adjuster = CameraAdjuster()
     wave_corrector = WaveCorrector()
     warper = Warper("spherical")
-    # explicit spherical
     seam_finder = SeamFinder()
     compensator = ExposureErrorCompensator()
 
-    # Start with first image; we will rebuild panorama each step with 0..i subset
-    panorama = work_imgs[0].copy()
+    # Initialize with first few images to establish coordinate system
+    INITIAL_SUBSET_SIZE = min(5, len(work_imgs))  # Use first 5 images (or all if fewer)
 
-    # Norm for pairwise visualization (cv BF): SIFT->L2; others->Hamming
-    norm = cv.NORM_L2 if DETECTOR.lower() == "sift" else cv.NORM_HAMMING
+    print(f"Initializing with first {INITIAL_SUBSET_SIZE} images...")
 
-    for i in range(1, len(work_imgs)):
-        print("\n" + "=" * 80)
-        print(f"STEP {i}: merge image {i+1}/{len(work_imgs)} :: {Path(imgs_list[i]).name}")
+    # Initial setup with first few images
+    initial_imgs = work_imgs[:INITIAL_SUBSET_SIZE]
+    initial_feats = features_stitch[:INITIAL_SUBSET_SIZE]
 
-        subset_imgs = work_imgs[:i+1]
-        subset_feats = features_stitch[:i+1]
+    # Match initial subset
+    initial_matches = matcher.match_features(initial_feats)
 
-        # Pairwise match visualization between (i-1, i) using OpenCV features computed earlier
-        kpsA, descA = all_kps[i-1], all_descs[i-1]
-        kpsB, descB = all_kps[i],   all_descs[i]
-        if descA is None or len(descA) == 0 or descB is None or len(descB) == 0:
-            print("Insufficient pairwise descriptors for visualization; skipping pairwise plot.")
-        else:
-            bf = cv.BFMatcher(norm, crossCheck=True)  # norm = L2 for SIFT else Hamming
-            pair_matches = bf.match(descA, descB)
-            pair_matches = sorted(pair_matches, key=lambda m: m.distance)[:200]
-            vis = cv.drawMatches(subset_imgs[i-1], kpsA, subset_imgs[i], kpsB, pair_matches, None, matchColor=(0, 255, 0))
-            plot_image(vis, figsize=(16, 8), title=f"Pairwise matches (img {i} → {i+1})")
+    # Keep connected component
+    subsetter = Subsetter(confidence_threshold=0.3)
+    idxs = subsetter.get_indices_to_keep(initial_feats, initial_matches)
 
-        # Camera estimation on current subset (estimate -> adjust -> wave-correct)
-        matches = matcher.match_features(subset_feats)
+    if len(idxs) == 0:
+        print("No connected component in initial subset; falling back to homography stitching")
+        USE_SPHERICAL = False
+    else:
+        if len(idxs) != len(initial_feats):
+            print(f"Dropping {len(initial_feats)-len(idxs)} unconnected images from initial subset")
+            initial_imgs = [initial_imgs[j] for j in idxs]
+            initial_feats = [initial_feats[j] for j in idxs]
+            initial_matches = subsetter.subset_matches(initial_matches, idxs)
 
-        # Enforce connected match graph and robustness for adjuster
-        subsetter = Subsetter(confidence_threshold=0.3)
-        idxs = subsetter.get_indices_to_keep(subset_feats, matches)
+        # Estimate cameras for initial subset
+        initial_cameras = camera_estimator.estimate(initial_feats, initial_matches)
 
-        if len(idxs) == 0:
-            print("No connected component found at this step; skipping image.")
-            continue
-
-        if len(idxs) != len(subset_feats):
-            print(f"Dropping {len(subset_feats)-len(idxs)} unconnected images at this step:", idxs)
-            subset_imgs = [subset_imgs[j] for j in idxs]
-            subset_feats = [subset_feats[j] for j in idxs]
-            matches = subsetter.subset_matches(matches, idxs)
-
-        cameras = camera_estimator.estimate(subset_feats, matches)
-
+        # Adjust cameras
         adjusted_ok = False
-        for th in (0.3, 0.0):
+        for th in (0.3, 0.1, 0.0):
             try:
                 camera_adjuster = CameraAdjuster(confidence_threshold=th)
-                cameras = camera_adjuster.adjust(subset_feats, matches, cameras)
+                initial_cameras = camera_adjuster.adjust(initial_feats, initial_matches, initial_cameras)
                 adjusted_ok = True
+                print(f"Initial camera adjustment succeeded at confidence_threshold={th}")
                 break
             except Exception as e:
-                print(f"Adjuster failed at confidence_threshold={th}: {e}")
+                print(f"Initial adjuster failed at confidence_threshold={th}: {e}")
 
         if not adjusted_ok:
-            print("Camera adjusting failed even after fallback; skipping this image.")
-            continue
+            print("Initial camera adjustment failed; falling back to homography stitching")
+            USE_SPHERICAL = False
+        else:
+            initial_cameras = wave_corrector.correct(initial_cameras)
 
-        cameras = wave_corrector.correct(cameras)
+            # Warp and blend initial subset
+            warper.set_scale(initial_cameras)
+            aspect = 1.0
+            sizes_in = [(img.shape[1], img.shape[0]) for img in initial_imgs]
 
-        # Set warper scale (use median focal internally)
-        warper.set_scale(cameras)
-        aspect = 1.0  # estimating & warping at same resolution
-        sizes_in = [(img.shape[1], img.shape[0]) for img in subset_imgs]
+            warped_imgs = list(warper.warp_images(initial_imgs, initial_cameras, aspect))
+            warped_masks = list(warper.create_and_warp_masks(sizes_in, initial_cameras, aspect))
+            corners, sizes_out = warper.warp_rois(sizes_in, initial_cameras, aspect)
 
-        # Warp images and masks (spherical)
-        warped_imgs = list(warper.warp_images(subset_imgs, cameras, aspect))
-        warped_masks = list(warper.create_and_warp_masks(sizes_in, cameras, aspect))
-        corners, sizes_out = warper.warp_rois(sizes_in, cameras, aspect)
+            # Seams and exposure compensation for initial
+            seam_masks = seam_finder.find(warped_imgs, corners, warped_masks)
+            compensator.feed(corners, warped_imgs, warped_masks)
+            compensated_imgs = [
+                compensator.apply(idx, corner, img, mask)
+                for idx, (img, mask, corner) in enumerate(zip(warped_imgs, warped_masks, corners))
+            ]
 
-        # Seams
-        seam_masks = seam_finder.find(warped_imgs, corners, warped_masks)
+            # Initial blend
+            blender = Blender()
+            blender.prepare(corners, sizes_out)
+            for img, mask, corner in zip(compensated_imgs, seam_masks, corners):
+                blender.feed(img, mask, corner)
+            panorama, _ = blender.blend()
 
-        # Exposure compensation (optional but helps blending)
-        compensator.feed(corners, warped_imgs, warped_masks)
-        compensated_imgs = [
-            compensator.apply(idx, corner, img, mask)
-            for idx, (img, mask, corner) in enumerate(zip(warped_imgs, warped_masks, corners))
-        ]
+            print(f"Initial panorama created with {len(initial_imgs)} images")
+            plot_image(panorama, figsize=(10, 10), title=f"Initial spherical mosaic")
 
-        # Blend to produce the current panorama
-        blender = Blender()
-        blender.prepare(corners, sizes_out)
-        for img, mask, corner in zip(compensated_imgs, seam_masks, corners):
-            blender.feed(img, mask, corner)
-        panorama, _ = blender.blend()
+            # Initialize cumulative state
+            cumulative_cameras = initial_cameras
+            cumulative_features = []
+            cumulative_descriptors = []
+            cumulative_points = []
 
-        plot_image(panorama, figsize=(10, 10), title=f"Spherical mosaic after img {i+1}")
+            # Collect features from initial images
+            for j, feat in enumerate(initial_feats):
+                pts = np.array([k.pt for k in feat.keypoints], dtype=np.float32)
+                desc = convert_to_numpy(feat.descriptors, DETECTOR)
+                if len(pts) > 0 and desc is not None and len(desc) > 0:
+                    # Ensure descriptors are proper numpy array
+                    if desc.ndim == 2 and desc.shape[0] > 0:
+                        # Transform points to panorama coordinate system
+                        if j < len(corners):
+                            corner = corners[j]
+                            pts_transformed = pts + np.array([corner[0], corner[1]], dtype=np.float32)
+                            cumulative_points.append(pts_transformed)
+                            cumulative_descriptors.append(desc)
+                            cumulative_features.append(feat)
 
-    # Save final spherical panorama
-    out_path = "one_at_a_time_spherical.png"
-    cv.imwrite(out_path, panorama)
-    print(f"Saved spherical panorama: {out_path}")
+            if cumulative_points:
+                cumulative_points = np.vstack(cumulative_points)
+                if len(cumulative_descriptors) > 0:
+                    try:
+                        cumulative_descriptors = np.vstack(cumulative_descriptors)
+                    except ValueError:
+                        # Handle case where descriptors have different shapes
+                        cumulative_descriptors = np.concatenate([desc.flatten() for desc in cumulative_descriptors])
+                        cumulative_descriptors = cumulative_descriptors.reshape(-1, cumulative_descriptors[0].shape[1] if len(cumulative_descriptors) > 0 else 32)
+                else:
+                    cumulative_descriptors = np.zeros((0, 32 if DETECTOR.lower() != 'sift' else 128),
+                                                     dtype=np.uint8 if DETECTOR.lower() != 'sift' else np.float32)
+
+            print(f"Initial feature bank: {len(cumulative_points) if len(cumulative_points) > 0 else 0} points")
+
+            # Now add remaining images incrementally
+            for i in range(INITIAL_SUBSET_SIZE, 8):
+                print("\n" + "=" * 80)
+                print(f"INCREMENTAL STEP: merge image {i+1}/{len(work_imgs)} :: {Path(imgs_list[i]).name}")
+
+                cur_img = work_imgs[i]
+                cur_feat = features_stitch[i]
+                cur_kps = all_kps[i]
+                cur_desc = convert_to_numpy(all_descs[i], DETECTOR)
+
+                if cur_desc is None or cur_desc.shape[0] == 0:
+                    print("No features in current image; skipping.")
+                    continue
+
+                # Match current image to cumulative feature bank
+                if cumulative_descriptors.size == 0:
+                    print("No cumulative features available; skipping.")
+                    continue
+
+                # Use ratio test matching
+                bf = cv.BFMatcher(descriptors_norm(DETECTOR), crossCheck=False)
+                knn_matches = bf.knnMatch(cumulative_descriptors, cur_desc, k=2)
+
+                good_matches = []
+                for m in knn_matches:
+                    if len(m) == 2:
+                        m1, m2 = m
+                        if m1.distance < 0.75 * m2.distance:
+                            good_matches.append(m1)
+
+                print(f"Matches to cumulative bank: {len(good_matches)}")
+
+                if len(good_matches) < 4:
+                    print("Insufficient matches to cumulative bank; skipping.")
+                    continue
+
+                # Estimate homography from matches
+                src_pts = np.float32([cumulative_points[m.queryIdx] for m in good_matches])
+                dst_pts = np.float32([cur_kps[m.trainIdx].pt for m in good_matches])
+
+                H, mask = cv.findHomography(src_pts, dst_pts, cv.RANSAC, 5.0)
+                if H is None or mask.sum() < 4:
+                    print("Homography estimation failed; skipping.")
+                    continue
+
+                inliers = mask.sum()
+                print(f"Homography inliers: {inliers}/{len(good_matches)}")
+
+                # For incremental camera estimation, we need to extend the camera array
+                # This is tricky in spherical coordinates - we'll use the homography to estimate
+                # the new camera relative to existing coordinate system
+
+                # Create a temporary feature set for camera estimation
+                temp_matches = []
+                # This is a simplified approach - in practice, you'd want more sophisticated
+                # camera parameter estimation for the new image
+
+                # For now, use a simple approach: assume the new camera has similar parameters
+                # to the last camera in the cumulative set
+                if len(cumulative_cameras) > 0:
+                    new_camera = cv.detail.CameraParams(cumulative_cameras[-1])  # Start with similar parameters
+
+                    # Warp the new image using estimated homography
+                    # This is approximate - a full implementation would need proper camera estimation
+
+                    # Transform current image points to panorama space
+                    cur_pts = np.array([k.pt for k in cur_kps], dtype=np.float32)
+                    cur_pts_transformed = cv.perspectiveTransform(cur_pts.reshape(-1, 1, 2), H).reshape(-1, 2)
+
+                    # Simple blending approach (similar to homography version)
+                    h_cur, w_cur = cur_img.shape[:2]
+                    img_corners = np.array([[0,0], [w_cur,0], [w_cur,h_cur], [0,h_cur]], dtype=np.float32)
+                    warped_corners = cv.perspectiveTransform(img_corners.reshape(-1, 1, 2), H).reshape(-1, 2)
+
+                    # Expand panorama if needed
+                    h_pan, w_pan = panorama.shape[:2]
+                    pan_corners = np.array([[0,0], [w_pan,0], [w_pan,h_pan], [0,h_pan]], dtype=np.float32)
+
+                    all_x = np.hstack([pan_corners[:,0], warped_corners[:,0]])
+                    all_y = np.hstack([pan_corners[:,1], warped_corners[:,1]])
+
+                    min_x, min_y = int(np.floor(all_x.min())), int(np.floor(all_y.min()))
+                    max_x, max_y = int(np.ceil(all_x.max())), int(np.ceil(all_y.max()))
+
+                    # Create expanded panorama
+                    expand_left = max(0, -min_x)
+                    expand_top = max(0, -min_y)
+                    new_w = max(w_pan + expand_left, max_x + expand_left)
+                    new_h = max(h_pan + expand_top, max_y + expand_top)
+
+                    if new_w > w_pan or new_h > h_pan:
+                        expanded_panorama = np.zeros((new_h, new_w, 3), dtype=np.uint8)
+                        expanded_panorama[expand_top:expand_top+h_pan, expand_left:expand_left+w_pan] = panorama
+                        panorama = expanded_panorama
+
+                        # Update cumulative points
+                        if len(cumulative_points) > 0:
+                            cumulative_points += np.array([expand_left, expand_top], dtype=np.float32)
+
+                    # Warp and blend current image
+                    H_adjusted = H.copy()
+                    H_adjusted[0, 2] += expand_left
+                    H_adjusted[1, 2] += expand_top
+
+                    warped_cur = cv.warpPerspective(cur_img, H_adjusted, (new_w, new_h))
+
+                    # Simple blending
+                    mask_cur = (warped_cur.sum(axis=2) > 0)
+                    mask_pan = (panorama.sum(axis=2) > 0)
+                    overlap = mask_cur & mask_pan
+                    only_cur = mask_cur & (~mask_pan)
+
+                    panorama[only_cur] = warped_cur[only_cur]
+                    if np.any(overlap):
+                        # Average in overlap
+                        panorama[overlap] = ((panorama[overlap].astype(np.float32) + warped_cur[overlap].astype(np.float32)) * 0.5).astype(np.uint8)
+
+                    # Update cumulative feature bank
+                    # Add new features (transformed to panorama space)
+                    new_pts = cur_pts_transformed + np.array([expand_left, expand_top], dtype=np.float32)
+                    if cur_desc is not None and len(cur_desc) > 0:
+                        # Ensure cur_desc is proper numpy array
+                        cur_desc_array = np.array(cur_desc, dtype=np.uint8 if DETECTOR.lower() != 'sift' else np.float32)
+                        if cur_desc_array.ndim == 2 and cur_desc_array.shape[0] > 0:
+                            if len(cumulative_points) > 0 and cumulative_descriptors.size > 0:
+                                try:
+                                    cumulative_points = np.vstack([cumulative_points, new_pts])
+                                    cumulative_descriptors = np.vstack([cumulative_descriptors, cur_desc_array])
+                                except ValueError:
+                                    # Handle shape mismatch
+                                    print("Warning: Descriptor shape mismatch, skipping feature bank update")
+                            else:
+                                cumulative_points = new_pts
+                                cumulative_descriptors = cur_desc_array
+
+                    print(f"Updated feature bank: {len(cumulative_points)} points")
+                    plot_image(panorama, figsize=(10, 10), title=f"Incremental spherical mosaic after img {i+1}")
+
+            # Save final incremental spherical panorama
+            out_path = "incremental_spherical_result.png"
+            cv.imwrite(out_path, panorama)
+            print(f"Saved incremental spherical panorama: {out_path}")
 
 # %% [markdown]
 # ## Manual, step-by-step spherical pipeline (debug-friendly)
@@ -428,63 +606,82 @@ if CUR_I >= 1:
     cur_conf = float(conf_matrix[CUR_I-1, CUR_I])
     print(f"Confidence for neighbor pair ({CUR_I-1},{CUR_I}): {cur_conf:.3f}")
     if cur_conf < 0.8:  # threshold for fallback, lowered to catch more cases
-        print(f"Low confidence detected for frame {CUR_I}. Running extensive fallback alignment...")
+        print("Retrying...")
+        # just try it again to be sure
+        conf_matrix = matcher_debug.get_confidence_matrix(matches_dbg)
+        time.sleep(0.01)
+        # print("conf_matrix after get_confidence_matrix:", conf_matrix)
 
-        imgA, imgB = subset_imgs[CUR_I-1], subset_imgs[CUR_I]
-        grayA, grayB = cv.cvtColor(imgA, cv.COLOR_BGR2GRAY), cv.cvtColor(imgB, cv.COLOR_BGR2GRAY)
+        print("Confidence matrix shape:", conf_matrix.shape)
+        np.set_printoptions(precision=3, suppress=True, linewidth=160)
+        # print(conf_matrix)
 
-        # Re-detect features with higher count for better matching
-        kpsA, descA, kpsB, descB = fallback_feature_detection(grayA, grayB, DETECTOR, nfeatures=10000)
+        # Neighbor confidences (k=1 diagonal) – useful for sequential merges
+        neighbor_conf = None
+        if conf_matrix.shape[0] > 1:
+            neighbor_conf = np.diag(conf_matrix, k=1)
+            print("Neighbor confidences (k=1 diagonal):", neighbor_conf)
+            print("Min neighbor confidence:", float(np.min(neighbor_conf)))
+        cur_conf = float(conf_matrix[CUR_I-1, CUR_I])
+        print(f"Confidence for neighbor pair ({CUR_I-1},{CUR_I}): {cur_conf:.3f}")
+        if cur_conf < 0.8:
+            print(f"Low confidence detected for frame {CUR_I}. Running extensive fallback alignment...")
 
-        if (descA is not None and descA.shape[0] > 0 and descB is not None and descB.shape[0] > 0 and
-            descA.shape[1] == descB.shape[1] and descA.dtype == descB.dtype):
-            norm = cv.NORM_L2 if DETECTOR.lower() == "sift" else cv.NORM_HAMMING
-            bf = cv.BFMatcher(norm, crossCheck=False)
+            imgA, imgB = subset_imgs[CUR_I-1], subset_imgs[CUR_I]
+            grayA, grayB = cv.cvtColor(imgA, cv.COLOR_BGR2GRAY), cv.cvtColor(imgB, cv.COLOR_BGR2GRAY)
 
-            try:
-                # Use KNN for better matching with ratio test
-                knn_matches = bf.knnMatch(descA, descB, k=2)
-                good_matches = []
-                for m in knn_matches:
-                    if len(m) == 2:
-                        m1, m2 = m
-                        if m1.distance < 0.75 * m2.distance:
-                            good_matches.append(m1)
-                    elif len(m) == 1:
-                        good_matches.append(m[0])
+            # Re-detect features with higher count for better matching
+            kpsA, descA, kpsB, descB = fallback_feature_detection(grayA, grayB, DETECTOR, nfeatures=10000)
 
-                if len(good_matches) >= 4:
-                    ptsA = np.float32([kpsA[m.queryIdx].pt for m in good_matches])
-                    ptsB = np.float32([kpsB[m.trainIdx].pt for m in good_matches])
-                    H, inliers = cv.findHomography(ptsA, ptsB, cv.RANSAC, 5.0)
-                    if H is not None and inliers.sum() >= 10:
-                        print(f"Fallback homography succeeded with {inliers.sum()} inliers.")
-                        # fabricate a MatchInfo-like object (minimal)
-                        m = matches_dbg[CUR_I-1]
-                        m.H = H
-                        m.num_inliers = int(inliers.sum())
-                        conf_matrix[CUR_I-1, CUR_I] = m.num_inliers / max(len(good_matches), 1)
-                    else:
-                        print("Homography fallback failed, trying ECC...")
-                        warp_matrix = np.eye(3, 3, dtype=np.float32)
-                        try:
-                            cc, warp_matrix = cv.findTransformECC(
-                                grayA, grayB, warp_matrix, cv.MOTION_HOMOGRAPHY,
-                                criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 5000, 1e-6)
-                            )
-                            print(f"ECC fallback succeeded (cc={cc:.4f}).")
+            if (descA is not None and descA.shape[0] > 0 and descB is not None and descB.shape[0] > 0 and
+                descA.shape[1] == descB.shape[1] and descA.dtype == descB.dtype):
+                norm = cv.NORM_L2 if DETECTOR.lower() == "sift" else cv.NORM_HAMMING
+                bf = cv.BFMatcher(norm, crossCheck=False)
+
+                try:
+                    # Use KNN for better matching with ratio test
+                    knn_matches = bf.knnMatch(descA, descB, k=2)
+                    good_matches = []
+                    for m in knn_matches:
+                        if len(m) == 2:
+                            m1, m2 = m
+                            if m1.distance < 0.75 * m2.distance:
+                                good_matches.append(m1)
+                        elif len(m) == 1:
+                            good_matches.append(m[0])
+
+                    if len(good_matches) >= 4:
+                        ptsA = np.float32([kpsA[m.queryIdx].pt for m in good_matches])
+                        ptsB = np.float32([kpsB[m.trainIdx].pt for m in good_matches])
+                        H, inliers = cv.findHomography(ptsA, ptsB, cv.RANSAC, 5.0)
+                        if H is not None and inliers.sum() >= 10:
+                            print(f"Fallback homography succeeded with {inliers.sum()} inliers.")
+                            # fabricate a MatchInfo-like object (minimal)
                             m = matches_dbg[CUR_I-1]
-                            m.H = warp_matrix
-                            m.num_inliers = 20  # fake count
-                            conf_matrix[CUR_I-1, CUR_I] = 0.5  # assign mid confidence
-                        except Exception as e:
-                            print("ECC fallback also failed:", e)
-                else:
-                    print("Not enough good matches after ratio test.")
-            except Exception as e:
-                print(f"BFMatcher failed in fallback: {e}")
-        else:
-            print("Descriptors missing or incompatible, cannot run fallback.")
+                            m.H = H
+                            m.num_inliers = int(inliers.sum())
+                            conf_matrix[CUR_I-1, CUR_I] = m.num_inliers / max(len(good_matches), 1)
+                        else:
+                            print("Homography fallback failed, trying ECC...")
+                            warp_matrix = np.eye(3, 3, dtype=np.float32)
+                            try:
+                                cc, warp_matrix = cv.findTransformECC(
+                                    grayA, grayB, warp_matrix, cv.MOTION_HOMOGRAPHY,
+                                    criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 5000, 1e-6)
+                                )
+                                print(f"ECC fallback succeeded (cc={cc:.4f}).")
+                                m = matches_dbg[CUR_I-1]
+                                m.H = warp_matrix
+                                m.num_inliers = 20  # fake count
+                                conf_matrix[CUR_I-1, CUR_I] = 0.5  # assign mid confidence
+                            except Exception as e:
+                                print("ECC fallback also failed:", e)
+                    else:
+                        print("Not enough good matches after ratio test.")
+                except Exception as e:
+                    print(f"BFMatcher failed in fallback: {e}")
+            else:
+                print("Descriptors missing or incompatible, cannot run fallback.")
 
 # Visualization of confidence matrix
 fig, ax = plt.subplots(figsize=(min(12, 2+2*conf_matrix.shape[0]), min(12, 2+2*conf_matrix.shape[1])))
@@ -788,12 +985,6 @@ def merge_feature_banks(base_pts: np.ndarray, base_desc: np.ndarray,
             new_desc = np.vstack([base_desc, add_desc]) if add_desc.size>0 else base_desc
 
     return new_pts, new_desc
-
-def descriptors_norm(detector_kind: str):
-    # ORB/BRISK/AKAZE -> binary -> Hamming; SIFT -> float -> L2
-    if detector_kind.lower() in ("sift",):
-        return cv.NORM_L2
-    return cv.NORM_HAMMING
 
 def ensure_desc_array(desc: np.ndarray, detector_kind: str):
     if desc is None:
