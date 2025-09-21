@@ -14,24 +14,26 @@
 # ---
 
 # %% [markdown]
-# # One-at-a-time incremental stitching
+# # Two-Stage Stitching with Known Camera Positions
 #
-# This notebook stitches a set of images incrementally, one image at a time (lexicographic order). It detects features once for all images, then merges images sequentially by matching the next image to the cumulative feature bank, estimating a homography, warping and blending, and merging feature sets while deduplicating matched common features. This avoids re-running feature detection on already-merged content. Intermediate visualizations are shown at each step.
+# This notebook implements a two-stage stitching approach:
+# 1. **Stage 1**: Spherical stitching within each ESP group (unchanged)
+# 2. **Stage 2**: Position-based stitching using known ESP locations (front, left, right, back) with optional fine-tuning
 #
-# Notes:
-# - Images are ordered by filename (lexicographically).
-# - Features are detected once per image up front.
-# - At each step, we match current image descriptors to the combined feature bank, estimate Homography (RANSAC), warp and blend to the current mosaic, and merge features (transforming them into the mosaic base frame, deduplicating within a pixel threshold so matched common features are counted only once).
-# - Resizing keeps the spirit of the tutorial (medium/low style) but NEVER upscales. Small images like 640x480 are kept at native resolution.
-# - Visualizations: keypoints (green dots), matches (lines), and the growing mosaic with cumulative keypoints.
+# The ESP cameras are positioned at approximately 90° intervals:
+# - ESP2: Front (0°)
+# - ESP3: Left (90°) 
+# - ESP1: Right (270°/-90°)
+# - ESP4: Back (180°)
 #
 
 # %%
 import os
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import time
 import re
+import math
 
 import numpy as np
 import cv2 as cv
@@ -88,6 +90,14 @@ EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 # Optionally override with explicit list
 IMAGE_PATHS: List[str] = []
 
+# ESP Physical Positions (in degrees, 0° = front/north)
+ESP_POSITIONS = {
+    'esp_2': 0,      # Front
+    'esp_3': 90,     # Left  
+    'esp_1': 270,    # Right (-90°)
+    'esp_4': 180     # Back
+}
+
 def list_images_sorted(image_dir: str) -> List[str]:
     files = [str(Path(image_dir) / f) for f in os.listdir(image_dir)
              if f.lower().endswith(EXTS) and not f.startswith('.')]
@@ -130,7 +140,9 @@ print(f"Found {len(imgs_list)} images")
 esp_groups = group_images_by_esp(imgs_list)
 print(f"\nGrouped into {len(esp_groups)} ESP devices:")
 for esp_id, paths in esp_groups.items():
-    print(f"  {esp_id}: {len(paths)} images")
+    position = ESP_POSITIONS.get(esp_id, "unknown")
+    direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(position, f"{position}°")
+    print(f"  {esp_id} ({direction}): {len(paths)} images")
     for i, path in enumerate(paths[:3]):  # Show first 3
         print(f"    • {Path(path).name}")
     if len(paths) > 3:
@@ -164,7 +176,7 @@ def resize_to_megapix(img: np.ndarray, target_mpix: float, allow_upscale: bool =
     return cv.resize(img, (new_w, new_h), interpolation=interp)
 
 # %% [markdown]
-# ## Stage 1: Spherical stitching within each ESP group
+# ## Stage 1: Spherical stitching within each ESP group (unchanged)
 
 # %%
 def stitch_esp_group_spherical(image_paths: List[str], esp_id: str, work_mpix: float = 0.6) -> np.ndarray:
@@ -410,150 +422,387 @@ for esp_id, image_paths in esp_groups.items():
     esp_panoramas[esp_id] = panorama
     
     # Show result
-    plot_image(panorama, figsize=(12, 8), title=f"ESP {esp_id} Panorama")
+    position = ESP_POSITIONS.get(esp_id, "unknown")
+    direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(position, f"{position}°")
+    plot_image(panorama, figsize=(12, 8), title=f"ESP {esp_id} ({direction}) Panorama")
 
 print(f"\nStage 1 completed: {len(esp_panoramas)} ESP panoramas created")
 
 # %% [markdown]
-# ## Stage 2: High-feature stitching of ESP panoramas
+# ## Stage 2: Position-based stitching with optional fine-tuning
 
 # %%
-def stitch_esp_panoramas_high_feature(panoramas: Dict[str, np.ndarray], high_mpix: float = 1.2) -> np.ndarray:
-    """Stitch the ESP panoramas together using high feature detection"""
+from cv2.detail import BundleAdjusterReproj
+class Camera:
+    """Simple camera representation for stitching library compatibility"""
+    def __init__(self, focal=1000, ppx=0, ppy=0, aspect=1.0, R=None, t=None):
+        self.focal = focal
+        self.aspect = aspect
+        self.ppx = ppx
+        self.ppy = ppy
+        if R is not None:
+            self.R = R.copy()
+        else:
+            self.R = np.eye(3, dtype=np.float32)
+        if t is not None:
+            self.t = t.copy()
+        else:
+            self.t = np.zeros(3, dtype=np.float32)
+            
+    @property
+    def K(self):
+        return np.array([
+            [self.focal, 0, self.ppx],
+            [0, self.focal * self.aspect, self.ppy],
+            [0, 0, 1]
+        ], dtype=np.float32)
+
+def create_position_based_cameras(panoramas, positions, base_focal=1000):
+    """Create OpenCV-compatible cameras based on known ESP positions"""
+    cameras = []
+    esp_ids = []
+    
+    sorted_esps = sorted([(esp_id, pos) for esp_id, pos in positions.items() 
+                         if esp_id in panoramas], key=lambda x: x[1])
+    
+    print("Creating position-based cameras:")
+    for esp_id, angle_deg in sorted_esps:
+        esp_ids.append(esp_id)
+        
+        # Rotation matrix (Y-axis rotation)
+        angle_rad = np.radians(angle_deg)
+        cos_a, sin_a = np.cos(-angle_rad), np.sin(-angle_rad)
+        R = np.array([[cos_a, 0, sin_a],
+                      [0, 1, 0],
+                      [-sin_a, 0, cos_a]], dtype=np.float32)
+        
+        # Image size → principal point
+        h, w = panoramas[esp_id].shape[:2]
+        
+        # Construct OpenCV CameraParams
+        cam = cv.detail_CameraParams()
+        cam.focal = base_focal
+        cam.aspect = 1.0
+        cam.ppx = w / 2.0
+        cam.ppy = h / 2.0
+        cam.R = R
+        cam.t = np.zeros((3, 1), np.float32)  # no translation
+        
+        cameras.append(cam)
+        
+        direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(angle_deg, f"{angle_deg}°")
+        print(f"  ESP {esp_id} ({direction}, {angle_deg}°): focal={cam.focal}")
+    
+    return cameras, esp_ids
+
+
+def try_fine_tune_cameras(cameras: List[Camera], 
+                         esp_ids: List[str],
+                         panoramas: Dict[str, np.ndarray],
+                         detector_type: str = "orb",
+                         n_features: int = 5000) -> List[Camera]:
+    """Try to fine-tune camera positions using feature matches"""
+    print(f"\nAttempting fine-tuning with {n_features} features...")
+    
+    try:
+        # Prepare images
+        imgs = [resize_to_megapix(panoramas[esp_id], 1.2, allow_upscale=False) 
+                for esp_id in esp_ids]
+        
+        # Detect features
+        if detector_type == "orb":
+            finder = FeatureDetector(detector=detector_type, nfeatures=n_features)
+        else:
+            finder = FeatureDetector(detector=detector_type)
+        features = [finder.detect_features(img) for img in imgs]
+        
+        feature_counts = [len(f.keypoints) for f in features]
+        print(f"Features detected: {feature_counts}")
+        
+        if min(feature_counts) < 100:
+            print("Too few features for fine-tuning, using position-based cameras")
+            return cameras
+        
+        # Match features
+        matcher = FeatureMatcher(matcher_type="homography", range_width=-1)
+        matches_dbg = matcher.match_features(features)
+        conf_matrix = matcher.get_confidence_matrix(matches_dbg)
+        print("conf_matrix after get_confidence_matrix:", conf_matrix)
+        
+        # Count good matches
+        print(len([m.confidence for m in matches_dbg]))
+        good_matches = [m for m in matches_dbg if m.confidence > 0.5]
+        print(f"Good matches found: {len(good_matches)}")
+        
+        fig, ax = plt.subplots(figsize=(min(12, 2+2*conf_matrix.shape[0]), min(12, 2+2*conf_matrix.shape[1])))
+        cax = ax.matshow(conf_matrix, interpolation='nearest')
+        fig.colorbar(cax)
+        for (i, j), z in np.ndenumerate(conf_matrix):
+            ax.text(j, i, f"{z:0.2f}", ha='center', va='center', fontsize=6, color="white" if z > 0.5 else "black")
+        plt.show()
+        
+        if len(good_matches) < 2:
+            print("Too few matches for fine-tuning, using position-based cameras")
+            return cameras
+        
+        # Try camera adjustment with low confidence threshold
+        print("Attempting camera adjustment...")
+        adjuster = CameraAdjuster(confidence_threshold=0.001)
+        adjusted_cameras = adjuster.adjust(features, matches_dbg, cameras)
+        
+        print("Fine-tuning successful!")
+        return adjusted_cameras
+        
+    except Exception as e:
+        print(f"Fine-tuning failed: {e}")
+        print("Using position-based cameras without adjustment")
+        return cameras
+
+def stitch_with_position_based_cameras(panoramas: Dict[str, np.ndarray], 
+                                     positions: Dict[str, float],
+                                     high_mpix: float = 1.2,
+                                     try_fine_tune: bool = True) -> np.ndarray:
+    """Stitch ESP panoramas using known positions with optional fine-tuning"""
     print(f"\n{'='*60}")
-    print(f"STAGE 2: High-feature stitching of {len(panoramas)} ESP panoramas")
+    print(f"STAGE 2: Position-based stitching of {len(panoramas)} ESP panoramas")
     print(f"{'='*60}")
     
     if len(panoramas) == 1:
         return list(panoramas.values())[0]
     
-    # Prepare images with higher resolution
-    esp_ids = list(panoramas.keys())
+    # Create position-based cameras
+    cameras, esp_ids = create_position_based_cameras(panoramas, positions, 250)
+    
+    if try_fine_tune:
+        # Try to fine-tune cameras using feature matches
+        # detectors - orb | brisk | akaze | sift
+        cameras = try_fine_tune_cameras(cameras, esp_ids, panoramas, "orb", N_FEATURES_INTER)
+    
+    # Prepare images at high resolution
     imgs = []
     for esp_id in esp_ids:
         img = resize_to_megapix(panoramas[esp_id], high_mpix, allow_upscale=False)
         imgs.append(img)
-        print(f"ESP {esp_id}: {img.shape[1]}x{img.shape[0]}")
+        h, w = img.shape[:2]
+        print(f"ESP {esp_id}: {w}x{h}")
     
     try:
-        # Use high feature count for better matching between ESP panoramas
-        finder = FeatureDetector(detector=DETECTOR, nfeatures=N_FEATURES_INTER)
-        matcher = FeatureMatcher(matcher_type="homography", range_width=-1)
+        # Apply wave correction to smooth out any discontinuities
+        print("Applying wave correction...")
+        corrector = WaveCorrector()
+        cameras = corrector.correct(cameras)
         
-        print("Detecting features (high count)...")
-        features = [finder.detect_features(img) for img in imgs]
-        print(f"Features detected: {[len(f.keypoints) for f in features]}")
+        # Warping using spherical projection
+        print("Warping images to spherical projection...")
+        warper = Warper("spherical")
+        warper.set_scale(cameras)
         
-        print("Matching features...")
-        matches = matcher.match_features(features)
-        print(f"Pairwise matches: {len([m for m in matches if m.confidence > 0.3])}")
+        sizes = [(img.shape[1], img.shape[0]) for img in imgs]
         
-        # Keep connected component
-        subsetter = Subsetter(confidence_threshold=0.2)  # Lower threshold for ESP panoramas
-        indices = subsetter.get_indices_to_keep(features, matches)
+        # Warp images and masks
+        warped_imgs = list(warper.warp_images(imgs, cameras, aspect=1.0))
+        warped_masks = list(warper.create_and_warp_masks(sizes, cameras, aspect=1.0))
+        corners, sizes_out = warper.warp_rois(sizes, cameras, aspect=1.0)
         
-        if len(indices) != len(features):
-            print(f"Keeping {len(indices)}/{len(features)} connected ESP panoramas")
-            imgs = [imgs[i] for i in indices]
-            features = [features[i] for i in indices]
-            matches = subsetter.subset_matches(matches, indices)
-            esp_ids = [esp_ids[i] for i in indices]
+        print(f"Warped image count: {len(warped_imgs)}")
+        print(f"Corner positions: {corners}")
         
-        if len(imgs) < 2:
-            print("Not enough connected panoramas")
-            return imgs[0] if imgs else np.zeros((480, 640, 3), dtype=np.uint8)
+        # Seam finding
+        print("Finding optimal seams...")
+        seam_finder = SeamFinder()
+        seam_masks = seam_finder.find(warped_imgs, corners, warped_masks)
         
-        # Try spherical stitching first
-        try:
-            print("Attempting spherical stitching...")
-            estimator = CameraEstimator()
-            cameras = estimator.estimate(features, matches)
-            
-            adjuster = CameraAdjuster(confidence_threshold=0.2)
-            cameras = adjuster.adjust(features, matches, cameras)
-            
-            corrector = WaveCorrector()
-            cameras = corrector.correct(cameras)
-            
-            warper = Warper("spherical")
-            warper.set_scale(cameras)
-            
-            sizes = [(img.shape[1], img.shape[0]) for img in imgs]
-            
-            warped_imgs = list(warper.warp_images(imgs, cameras, aspect=1.0))
-            warped_masks = list(warper.create_and_warp_masks(sizes, cameras, aspect=1.0))
-            corners, sizes_out = warper.warp_rois(sizes, cameras, aspect=1.0)
-            
-            seam_finder = SeamFinder()
-            seam_masks = seam_finder.find(warped_imgs, corners, warped_masks)
-            
-            compensator = ExposureErrorCompensator()
-            compensator.feed(corners, warped_imgs, warped_masks)
-            compensated_imgs = [
-                compensator.apply(i, corner, img, mask)
-                for i, (img, mask, corner) in enumerate(zip(warped_imgs, warped_masks, corners))
-            ]
-            
-            blender = Blender()
-            blender.prepare(corners, sizes_out)
-            for img, mask, corner in zip(compensated_imgs, seam_masks, corners):
-                blender.feed(img, mask, corner)
-            
-            result, _ = blender.blend()
-            print(f"Spherical stitching successful: {result.shape[1]}x{result.shape[0]}")
-            return result
-            
-        except Exception as e:
-            print(f"Spherical stitching failed: {e}")
-            print("Falling back to homography stitching...")
-    
+        # Exposure compensation
+        print("Compensating exposure differences...")
+        compensator = ExposureErrorCompensator()
+        compensator.feed(corners, warped_imgs, warped_masks)
+        compensated_imgs = [
+            compensator.apply(i, corner, img, mask)
+            for i, (img, mask, corner) in enumerate(zip(warped_imgs, warped_masks, corners))
+        ]
+        
+        # Blending
+        print("Blending images...")
+        blender = Blender()
+        blender.prepare(corners, sizes_out)
+        for img, mask, corner in zip(compensated_imgs, seam_masks, corners):
+            blender.feed(img, mask, corner)
+        
+        result, _ = blender.blend()
+        
+        print(f"Position-based stitching successful: {result.shape[1]}x{result.shape[0]}")
+        return result
+        
     except Exception as e:
-        print(f"Feature-based stitching setup failed: {e}")
-    
-    # Fallback: sequential homography stitching
-    print("Using sequential homography stitching...")
-    result = imgs[0]
-    for i in range(1, len(imgs)):
-        print(f"Stitching ESP {esp_ids[0]} with ESP {esp_ids[i]}...")
-        result = simple_stitch_pair(result, imgs[i], DETECTOR, N_FEATURES_INTER)
-        esp_ids[0] = f"{esp_ids[0]}+{esp_ids[i]}"  # Update combined name
-    
-    return result
+        print(f"Position-based spherical stitching failed: {e}")
+        print("Falling back to simple sequential stitching...")
+        
+        # Fallback: sequential homography stitching in angular order
+        result = imgs[0]
+        for i in range(1, len(imgs)):
+            print(f"Stitching ESP {esp_ids[0]} with ESP {esp_ids[i]}...")
+            result = simple_stitch_pair(result, imgs[i], DETECTOR, N_FEATURES_INTER)
+        
+        return result
 
-# Perform Stage 2 stitching
-print("Starting Stage 2: Inter-ESP stitching...")
-final_panorama = stitch_esp_panoramas_high_feature(esp_panoramas, HIGH_MPIX)
+# Perform Stage 2 stitching using position information
+print("Starting Stage 2: Position-based inter-ESP stitching...")
+final_panorama = stitch_with_position_based_cameras(
+    esp_panoramas, 
+    ESP_POSITIONS, 
+    HIGH_MPIX,
+    try_fine_tune=True  # Set to False to skip fine-tuning
+)
 
 # Show final result
-plot_image(final_panorama, figsize=(15, 10), title="Final Two-Stage Panorama")
+plot_image(final_panorama, figsize=(15, 10), title="Final Position-Based Panorama")
 
 # Save final result
-final_output_path = "final_two_stage_panorama.jpg"
+final_output_path = "final_position_based_panorama.jpg"
 cv.imwrite(final_output_path, final_panorama)
 print(f"\nFinal panorama saved: {final_output_path}")
 print(f"Final size: {final_panorama.shape[1]}x{final_panorama.shape[0]}")
 
 # %% [markdown]
-# # Summary and comparison
-#
+# ## Summary and Analysis
 
 # %%
 print(f"\n{'='*80}")
-print("TWO-STAGE STITCHING SUMMARY")
+print("POSITION-BASED TWO-STAGE STITCHING SUMMARY")
 print(f"{'='*80}")
 print(f"Stage 1 (Intra-ESP spherical stitching):")
 for esp_id, panorama in esp_panoramas.items():
     h, w = panorama.shape[:2]
-    print(f"  ESP {esp_id}: {len(esp_groups[esp_id])} images → {w}x{h} panorama")
+    position = ESP_POSITIONS.get(esp_id, "unknown")
+    direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(position, f"{position}°")
+    print(f"  ESP {esp_id} ({direction}): {len(esp_groups[esp_id])} images → {w}x{h} panorama")
 
-print(f"\nStage 2 (Inter-ESP high-feature stitching):")
+print(f"\nStage 2 (Position-based inter-ESP stitching):")
+print(f"  Used known camera positions: Front(0°), Left(90°), Right(270°), Back(180°)")
 print(f"  {len(esp_panoramas)} ESP panoramas → {final_panorama.shape[1]}x{final_panorama.shape[0]} final panorama")
 
-print(f"\nAdvantages of this approach:")
-print("  • Leverages high overlap within ESP groups for robust spherical stitching")
-print("  • Uses high feature detection for challenging inter-ESP matching")
-print("  • More computationally efficient than processing all images together")
-print("  • Better handles varying overlap patterns between different ESP devices")
-print("  • Reduces accumulation of registration errors")
+print(f"\nAdvantages of position-based approach:")
+print("  • Robust even with minimal feature overlap between ESP groups")
+print("  • Uses physical knowledge to initialize camera orientations")
+print("  • Optional fine-tuning with available feature matches")
+print("  • More predictable and stable results")
+print("  • Handles 360° coverage systematically")
+print("  • Reduces dependency on feature detection quality")
+
+print(f"\nTechnical details:")
+print("  • ESP cameras positioned at ~90° intervals around a central point")
+print("  • Each ESP camera rotation matrix created from known angular position")
+print("  • Optional feature-based fine-tuning for minor adjustments")
+print("  • Spherical warping preserves the 360° nature of the capture")
+print("  • Wave correction smooths any remaining discontinuities")
+
+# %% [markdown]
+# ## Optional: Compare with different settings
+
+# %%
+# You can experiment with different parameters:
+
+# Try without fine-tuning (pure position-based)
+print(f"\n{'='*60}")
+print("EXPERIMENT: Pure position-based (no fine-tuning)")
+print(f"{'='*60}")
+
+final_panorama_pure = stitch_with_position_based_cameras(
+    esp_panoramas, 
+    ESP_POSITIONS, 
+    HIGH_MPIX,
+    try_fine_tune=False
+)
+
+plot_image(final_panorama_pure, figsize=(15, 10), title="Pure Position-Based Panorama (No Fine-tuning)")
+
+# Save pure position-based result
+pure_output_path = "final_pure_position_panorama.jpg"
+cv.imwrite(pure_output_path, final_panorama_pure)
+print(f"Pure position-based panorama saved: {pure_output_path}")
+
+# %% [markdown]
+# ## Advanced: Custom position adjustment
+
+# %%
+def create_custom_position_cameras(panoramas: Dict[str, np.ndarray], 
+                                 custom_positions: Dict[str, Tuple[float, float, float]],
+                                 base_focal: float = 1000) -> List[Camera]:
+    """Create cameras with custom pan, tilt, roll adjustments"""
+    cameras = []
+    esp_ids = []
+    
+    print(f"Creating custom position cameras:")
+    for esp_id, (pan, tilt, roll) in custom_positions.items():
+        if esp_id not in panoramas:
+            continue
+            
+        esp_ids.append(esp_id)
+        
+        # Convert angles to radians
+        pan_rad = np.radians(pan)
+        tilt_rad = np.radians(tilt)  
+        roll_rad = np.radians(roll)
+        
+        # Create rotation matrices
+        # Pan (Y-axis rotation)
+        R_pan = np.array([[np.cos(-pan_rad), 0, np.sin(-pan_rad)],
+                          [0, 1, 0],
+                          [-np.sin(-pan_rad), 0, np.cos(-pan_rad)]], dtype=np.float32)
+        
+        # Tilt (X-axis rotation)  
+        R_tilt = np.array([[1, 0, 0],
+                           [0, np.cos(-tilt_rad), -np.sin(-tilt_rad)],
+                           [0, np.sin(-tilt_rad), np.cos(-tilt_rad)]], dtype=np.float32)
+        
+        # Roll (Z-axis rotation)
+        R_roll = np.array([[np.cos(-roll_rad), -np.sin(-roll_rad), 0],
+                           [np.sin(-roll_rad), np.cos(-roll_rad), 0],
+                           [0, 0, 1]], dtype=np.float32)
+        
+        # Combined rotation: R = R_roll * R_tilt * R_pan
+        R = R_roll @ R_tilt @ R_pan
+        
+        # Get image size for principal point
+        h, w = panoramas[esp_id].shape[:2]
+        
+        # Create camera
+        camera = Camera(
+            focal=base_focal,
+            ppx=w/2,
+            ppy=h/2,
+            aspect=1.0,
+            R=R
+        )
+        
+        cameras.append(camera)
+        print(f"  ESP {esp_id}: pan={pan}°, tilt={tilt}°, roll={roll}°")
+    
+    return cameras, esp_ids
+
+# Example: Fine adjustments to the base positions
+# You can modify these values if the initial result needs tweaking
+CUSTOM_POSITIONS = {
+    'esp_2': (0, 0, 0),      # Front: pan=0°, tilt=0°, roll=0°
+    'esp_3': (90, 0, 0),     # Left: pan=90°, tilt=0°, roll=0°
+    'esp_1': (270, 0, 0),    # Right: pan=270°, tilt=0°, roll=0° 
+    'esp_4': (180, 0, 0)     # Back: pan=180°, tilt=0°, roll=0°
+}
+
+# Uncomment to try custom positions:
+print(f"\n{'='*60}")
+print("EXPERIMENT: Custom position adjustments")
+print(f"{'='*60}")
+
+custom_cameras, custom_esp_ids = create_custom_position_cameras(esp_panoramas, CUSTOM_POSITIONS, 250)
+# ... (rest of stitching pipeline would go here)
+
+print(f"\nTo experiment with custom positions:")
+print(f"1. Modify the CUSTOM_POSITIONS dictionary above")
+print(f"2. Uncomment the custom position experiment section")
+print(f"3. Adjust pan/tilt/roll values as needed:")
+print(f"   - Pan: horizontal rotation (0°=front, 90°=left, 180°=back, 270°=right)")
+print(f"   - Tilt: vertical rotation (positive=up, negative=down)")
+print(f"   - Roll: camera rotation around viewing axis")
 
 # %%
