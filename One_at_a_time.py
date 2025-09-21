@@ -766,16 +766,16 @@ def create_custom_position_cameras(panoramas: Dict[str, np.ndarray],
         # Get image size for principal point
         h, w = panoramas[esp_id].shape[:2]
         
-        # Create camera
-        camera = Camera(
-            focal=base_focal,
-            ppx=w/2,
-            ppy=h/2,
-            aspect=1.0,
-            R=R
-        )
+        # Construct OpenCV CameraParams
+        cam = cv.detail_CameraParams()
+        cam.focal = base_focal
+        cam.aspect = 1.0
+        cam.ppx = w / 2.0
+        cam.ppy = h / 2.0
+        cam.R = R
+        cam.t = np.zeros((3, 1), np.float32)  # no translation
         
-        cameras.append(camera)
+        cameras.append(cam)
         print(f"  ESP {esp_id}: pan={pan}°, tilt={tilt}°, roll={roll}°")
     
     return cameras, esp_ids
@@ -784,9 +784,9 @@ def create_custom_position_cameras(panoramas: Dict[str, np.ndarray],
 # You can modify these values if the initial result needs tweaking
 CUSTOM_POSITIONS = {
     'esp_2': (0, 0, 0),      # Front: pan=0°, tilt=0°, roll=0°
-    'esp_3': (90, 0, 0),     # Left: pan=90°, tilt=0°, roll=0°
-    'esp_1': (270, 0, 0),    # Right: pan=270°, tilt=0°, roll=0° 
-    'esp_4': (180, 0, 0)     # Back: pan=180°, tilt=0°, roll=0°
+    'esp_3': (80, 0, 0),     # Left: pan=90°, tilt=0°, roll=0°
+    'esp_4': (165, 0, 0),     # Back: pan=180°, tilt=0°, roll=0°
+    'esp_1': (270, 0, 0)    # Right: pan=270°, tilt=0°, roll=0° 
 }
 
 # Uncomment to try custom positions:
@@ -794,7 +794,7 @@ print(f"\n{'='*60}")
 print("EXPERIMENT: Custom position adjustments")
 print(f"{'='*60}")
 
-custom_cameras, custom_esp_ids = create_custom_position_cameras(esp_panoramas, CUSTOM_POSITIONS, 250)
+# custom_cameras, custom_esp_ids = create_custom_position_cameras(esp_panoramas, CUSTOM_POSITIONS, 250)
 # ... (rest of stitching pipeline would go here)
 
 print(f"\nTo experiment with custom positions:")
@@ -804,5 +804,475 @@ print(f"3. Adjust pan/tilt/roll values as needed:")
 print(f"   - Pan: horizontal rotation (0°=front, 90°=left, 180°=back, 270°=right)")
 print(f"   - Tilt: vertical rotation (positive=up, negative=down)")
 print(f"   - Roll: camera rotation around viewing axis")
+
+# %%
+from cv2.detail import BundleAdjusterReproj
+class Camera:
+    """Simple camera representation for stitching library compatibility"""
+    def __init__(self, focal=1000, ppx=0, ppy=0, aspect=1.0, R=None, t=None):
+        self.focal = focal
+        self.aspect = aspect
+        self.ppx = ppx
+        self.ppy = ppy
+        if R is not None:
+            self.R = R.copy()
+        else:
+            self.R = np.eye(3, dtype=np.float32)
+        if t is not None:
+            self.t = t.copy()
+        else:
+            self.t = np.zeros(3, dtype=np.float32)
+            
+    @property
+    def K(self):
+        return np.array([
+            [self.focal, 0, self.ppx],
+            [0, self.focal * self.aspect, self.ppy],
+            [0, 0, 1]
+        ], dtype=np.float32)
+
+def stitch_with_position_based_cameras(panoramas: Dict[str, np.ndarray],
+                                     high_mpix: float = 1.2,
+                                     try_fine_tune: bool = True) -> np.ndarray:
+    """Stitch ESP panoramas using known positions with optional fine-tuning"""
+    print(f"\n{'='*60}")
+    print(f"STAGE 2: Position-based stitching of {len(panoramas)} ESP panoramas")
+    print(f"{'='*60}")
+    
+    if len(panoramas) == 1:
+        return list(panoramas.values())[0]
+    
+    # Create custom-position-based cameras
+    cameras, esp_ids = create_custom_position_cameras(esp_panoramas, CUSTOM_POSITIONS, 250)
+    
+    # Prepare images at high resolution
+    imgs = []
+    for esp_id in esp_ids:
+        img = resize_to_megapix(panoramas[esp_id], high_mpix, allow_upscale=False)
+        imgs.append(img)
+        h, w = img.shape[:2]
+        print(f"ESP {esp_id}: {w}x{h}")
+    
+    try:
+        # Apply wave correction to smooth out any discontinuities
+        print("Applying wave correction...")
+        corrector = WaveCorrector()
+        cameras = corrector.correct(cameras)
+        
+        # Warping using spherical projection
+        print("Warping images to spherical projection...")
+        warper = Warper("spherical")
+        warper.set_scale(cameras)
+        
+        sizes = [(img.shape[1], img.shape[0]) for img in imgs]
+        
+        # Warp images and masks
+        warped_imgs = list(warper.warp_images(imgs, cameras, aspect=1.0))
+        warped_masks = list(warper.create_and_warp_masks(sizes, cameras, aspect=1.0))
+        corners, sizes_out = warper.warp_rois(sizes, cameras, aspect=1.0)
+        
+        print(f"Warped image count: {len(warped_imgs)}")
+        print(f"Corner positions: {corners}")
+        
+        # Seam finding
+        print("Finding optimal seams...")
+        seam_finder = SeamFinder()
+        seam_masks = seam_finder.find(warped_imgs, corners, warped_masks)
+        
+        # Exposure compensation
+        print("Compensating exposure differences...")
+        compensator = ExposureErrorCompensator()
+        compensator.feed(corners, warped_imgs, warped_masks)
+        compensated_imgs = [
+            compensator.apply(i, corner, img, mask)
+            for i, (img, mask, corner) in enumerate(zip(warped_imgs, warped_masks, corners))
+        ]
+        
+        # Blending
+        print("Blending images...")
+        blender = Blender()
+        blender.prepare(corners, sizes_out)
+        for img, mask, corner in zip(compensated_imgs, seam_masks, corners):
+            blender.feed(img, mask, corner)
+        
+        result, _ = blender.blend()
+        
+        print(f"Position-based stitching successful: {result.shape[1]}x{result.shape[0]}")
+        return result
+        
+    except Exception as e:
+        print(f"Position-based spherical stitching failed: {e}")
+        print("Falling back to simple sequential stitching...")
+        
+        # Fallback: sequential homography stitching in angular order
+        result = imgs[0]
+        for i in range(1, len(imgs)):
+            print(f"Stitching ESP {esp_ids[0]} with ESP {esp_ids[i]}...")
+            result = simple_stitch_pair(result, imgs[i], DETECTOR, N_FEATURES_INTER)
+        
+        return result
+
+# Perform Stage 2 stitching using position information
+print("Starting Stage 2: Custom Position-based inter-ESP stitching...")
+final_panorama = stitch_with_position_based_cameras(
+    esp_panoramas,
+    HIGH_MPIX,
+    try_fine_tune=False  # Set to False to skip fine-tuning
+)
+
+# Show final result
+plot_image(final_panorama, figsize=(15, 10), title="Final Position-Based Panorama")
+
+# Save final result
+final_output_path = "final_custom_position_based_panorama.jpg"
+cv.imwrite(final_output_path, final_panorama)
+print(f"\nFinal panorama saved: {final_output_path}")
+print(f"Final size: {final_panorama.shape[1]}x{final_panorama.shape[0]}")
+
+# %% [markdown]
+# ## Cell 1: Show the 4 current stitched ESP images side by side
+
+# %%
+# Display the 4 ESP panoramas side by side
+esp_images = []
+esp_titles = []
+for esp_id in sorted(esp_panoramas.keys()):
+    position = ESP_POSITIONS.get(esp_id, "unknown")
+    direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(position, f"{position}°")
+    esp_images.append(esp_panoramas[esp_id])
+    esp_titles.append(f"ESP {esp_id}\n({direction})")
+
+plot_images(esp_images, titles=esp_titles, figsize=(20, 8))
+
+# %% [markdown]
+# ## Cell 2: ORB feature extraction and visualization
+
+# %%
+def detect_and_visualize_features(img, title="", n_features=5000):
+    """Detect ORB features and return image with features drawn"""
+    # Create ORB detector
+    orb = cv.ORB_create(nfeatures=n_features)
+
+    # Detect keypoints
+    keypoints, descriptors = orb.detectAndCompute(img, None)
+
+    # Draw keypoints on image
+    img_with_keypoints = cv.drawKeypoints(img, keypoints, None,
+                                        color=(0, 255, 0),  # Green color
+                                        flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+
+    print(f"{title}: {len(keypoints)} ORB features detected")
+    return img_with_keypoints, keypoints, descriptors
+
+# Detect features in all 4 ESP panoramas
+feature_images = []
+feature_titles = []
+
+for esp_id in sorted(esp_panoramas.keys()):
+    position = ESP_POSITIONS.get(esp_id, "unknown")
+    direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(position, f"{position}°")
+
+    img_with_features, keypoints, descriptors = detect_and_visualize_features(
+        esp_panoramas[esp_id],
+        f"ESP {esp_id} ({direction})",
+        n_features=N_FEATURES_INTER
+    )
+
+    feature_images.append(img_with_features)
+    feature_titles.append(f"ESP {esp_id}\n({direction})\n{len(keypoints)} features")
+
+# Display feature visualizations side by side
+plot_images(feature_images, titles=feature_titles, figsize=(20, 8))
+
+# %% [markdown]
+# ## Cell 3: Identify and visualize good feature matches between ESP pairs
+
+# %%
+def find_good_matches_between_pairs(images, esp_ids, detector_type="orb", n_features=5000, positions=None):
+    """Find good feature matches between adjacent pairs of ESP images"""
+    # Detect features for all images
+    all_keypoints = []
+    all_descriptors = []
+
+    for img in images:
+        orb = cv.ORB_create(nfeatures=n_features)
+        kp, desc = orb.detectAndCompute(img, None)
+        all_keypoints.append(kp)
+        all_descriptors.append(desc)
+
+    # Define adjacent pairs based on angular positions
+    adjacent_pairs = []
+    if positions:
+        # Sort ESPs by their angular position
+        sorted_esps = sorted([(esp_id, pos) for esp_id, pos in positions.items()], key=lambda x: x[1])
+        n = len(sorted_esps)
+
+        # Create adjacent pairs (including wrap-around from last to first)
+        for i in range(n):
+            esp_i = sorted_esps[i][0]
+            esp_j = sorted_esps[(i + 1) % n][0]  # Next ESP, wrapping around
+            adjacent_pairs.append((esp_i, esp_j))
+    else:
+        # Fallback: assume esp_ids are in order and create sequential pairs
+        n = len(esp_ids)
+        for i in range(n):
+            esp_i = esp_ids[i]
+            esp_j = esp_ids[(i + 1) % n]  # Next ESP, wrapping around
+            adjacent_pairs.append((esp_i, esp_j))
+
+    print(f"Matching adjacent ESP pairs: {adjacent_pairs}")
+
+    # Find matches only between adjacent pairs
+    matches_info = {}
+
+    for esp_i, esp_j in adjacent_pairs:
+        # Find indices in our arrays
+        try:
+            idx_i = esp_ids.index(esp_i)
+            idx_j = esp_ids.index(esp_j)
+        except ValueError:
+            continue
+
+        # Match descriptors
+        bf = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=False)
+        matches = bf.knnMatch(all_descriptors[idx_i], all_descriptors[idx_j], k=2)
+
+        # Apply ratio test
+        good_matches = []
+        for m, n in matches:
+            if m.distance < 0.75 * n.distance:
+                good_matches.append(m)
+
+        matches_info[(esp_i, esp_j)] = {
+            'matches': good_matches,
+            'keypoints1': all_keypoints[idx_i],
+            'keypoints2': all_keypoints[idx_j]
+        }
+
+        print(f"ESP {esp_i} ↔ ESP {esp_j}: {len(good_matches)} good matches")
+
+    return matches_info
+
+def draw_matches_between_images(img1, img2, kp1, kp2, matches, title=""):
+    """Draw feature matches between two images side by side"""
+    # Create a combined image
+    h1, w1 = img1.shape[:2]
+    h2, w2 = img2.shape[:2]
+
+    # Create canvas for side-by-side display
+    canvas = np.zeros((max(h1, h2), w1 + w2, 3), dtype=np.uint8)
+
+    # Place images side by side
+    canvas[:h1, :w1] = img1
+    canvas[:h2, w1:w1+w2] = img2
+
+    # Draw lines connecting matched features
+    for match in matches[:50]:  # Limit to first 50 matches for clarity
+        # Get keypoint coordinates
+        pt1 = (int(kp1[match.queryIdx].pt[0]), int(kp1[match.queryIdx].pt[1]))
+        pt2 = (int(kp2[match.trainIdx].pt[0] + w1), int(kp2[match.trainIdx].pt[1]))
+
+        # Draw line connecting the points
+        cv.line(canvas, pt1, pt2, (255, 0, 0), 1)  # Blue line
+
+        # Draw circles at feature points
+        cv.circle(canvas, pt1, 3, (0, 255, 0), -1)  # Green circle
+        cv.circle(canvas, pt2, 3, (0, 255, 0), -1)  # Green circle
+
+    plt.figure(figsize=(15, 8))
+    plt.imshow(cv.cvtColor(canvas, cv.COLOR_BGR2RGB))
+    plt.title(f"{title} ({len(matches)} matches)")
+    plt.axis('off')
+    plt.show()
+
+# Prepare images and ESP IDs in sorted order
+esp_sorted = sorted(esp_panoramas.keys())
+images_sorted = [esp_panoramas[esp_id] for esp_id in esp_sorted]
+
+# Find matches between adjacent pairs only
+matches_info = find_good_matches_between_pairs(images_sorted, esp_sorted, "orb", N_FEATURES_INTER, ESP_POSITIONS)
+
+# Visualize matches for each pair
+for (esp_i, esp_j), match_data in matches_info.items():
+    pos_i = ESP_POSITIONS.get(esp_i, "unknown")
+    pos_j = ESP_POSITIONS.get(esp_j, "unknown")
+    dir_i = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(pos_i, f"{pos_i}°")
+    dir_j = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(pos_j, f"{pos_j}°")
+
+    title = f"Feature Matches: ESP {esp_i} ({dir_i}) ↔ ESP {esp_j} ({dir_j})"
+    draw_matches_between_images(
+        esp_panoramas[esp_i], esp_panoramas[esp_j],
+        match_data['keypoints1'], match_data['keypoints2'],
+        match_data['matches'], title
+    )
+
+# %% [markdown]
+# ## Cell 4: Optimize ESP angles for minimal feature match distances
+
+# %%
+def calculate_match_distances(matches_info, current_positions):
+    """Calculate average feature match distances for current ESP positions"""
+    total_distance = 0
+    total_matches = 0
+
+    for (esp_i, esp_j), match_data in matches_info.items():
+        matches = match_data['matches']
+        kp1 = match_data['keypoints1']
+        kp2 = match_data['keypoints2']
+
+        if len(matches) == 0:
+            continue
+
+        pair_distance = 0
+        for match in matches:
+            pt1 = kp1[match.queryIdx].pt
+            pt2 = kp2[match.trainIdx].pt
+
+            # Calculate Euclidean distance between matched points
+            distance = np.sqrt((pt1[0] - pt2[0])**2 + (pt1[1] - pt2[1])**2)
+            pair_distance += distance
+
+        avg_pair_distance = pair_distance / len(matches)
+        total_distance += avg_pair_distance * len(matches)
+        total_matches += len(matches)
+
+        print(f"ESP {esp_i} ↔ ESP {esp_j}: {len(matches)} matches, avg distance = {avg_pair_distance:.1f}")
+
+    if total_matches == 0:
+        return float('inf')
+
+    overall_avg_distance = total_distance / total_matches
+    return overall_avg_distance
+
+def optimize_esp_angles(matches_info, initial_positions, max_iterations=50, learning_rate=0.5):
+    """Optimize ESP angles to minimize feature match distances"""
+    positions = initial_positions.copy()
+    best_positions = positions.copy()
+    best_distance = calculate_match_distances(matches_info, positions)
+
+    print(f"\nStarting optimization with initial average distance: {best_distance:.2f}")
+    print("Initial positions:", {esp: f"{pos}°" for esp, pos in positions.items()})
+
+    for iteration in range(max_iterations):
+        improved = False
+
+        for esp_id in positions.keys():
+            # Try small adjustments to this ESP's angle
+            for delta in [-learning_rate, learning_rate]:
+                test_positions = positions.copy()
+                test_positions[esp_id] = (positions[esp_id] + delta) % 360
+
+                test_distance = calculate_match_distances(matches_info, test_positions)
+
+                if test_distance < best_distance:
+                    best_distance = test_distance
+                    best_positions = test_positions.copy()
+                    improved = True
+                    print(f"  Iteration {iteration+1}: ESP {esp_id} {delta:+.1f}° → distance {test_distance:.2f}")
+                    break
+
+            if improved:
+                positions = best_positions.copy()
+                break
+
+        if not improved:
+            print(f"No improvement found at iteration {iteration+1}, stopping")
+            break
+
+    print(f"\nOptimization complete after {iteration+1} iterations")
+    print(f"Final average distance: {best_distance:.2f}")
+    print("Optimized positions:", {esp: f"{pos:.1f}°" for esp, pos in best_positions.items()})
+
+    return best_positions
+
+# Calculate current match distances
+print("Current feature match distances:")
+current_avg_distance = calculate_match_distances(matches_info, ESP_POSITIONS)
+
+# Optimize ESP angles
+print(f"\n{'='*60}")
+print("OPTIMIZING ESP ANGLES FOR MINIMAL FEATURE MATCH DISTANCES")
+print(f"{'='*60}")
+
+optimized_positions = optimize_esp_angles(matches_info, ESP_POSITIONS, max_iterations=20, learning_rate=1.0)
+
+# Compare before and after
+print(f"\n{'='*60}")
+print("COMPARISON")
+print(f"{'='*60}")
+print("Original ESP positions:")
+for esp_id, angle in ESP_POSITIONS.items():
+    direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(angle, f"{angle}°")
+    print(f"  ESP {esp_id}: {angle}° ({direction})")
+
+print("\nOptimized ESP positions:")
+for esp_id, angle in optimized_positions.items():
+    direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(angle, f"{angle}°")
+    print(f"  ESP {esp_id}: {angle:.1f}° ({direction})")
+
+# %% [markdown]
+# ## Optional: Individual ESP focal length settings
+
+# %%
+# Individual focal lengths for each ESP (can be tuned separately)
+ESP_FOCAL_LENGTHS = {
+    'esp_2': 250,   # Front
+    'esp_3': 250,   # Left
+    'esp_1': 250,   # Right
+    'esp_4': 250    # Back
+}
+
+print("Individual ESP focal length settings:")
+print("(Modify these values to fine-tune each camera's focal length)")
+for esp_id, focal in ESP_FOCAL_LENGTHS.items():
+    position = ESP_POSITIONS.get(esp_id, "unknown")
+    direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(position, f"{position}°")
+    print(f"  ESP {esp_id} ({direction}): focal = {focal}")
+
+# Example of how to use custom focal lengths in camera creation
+def create_position_based_cameras_with_custom_focals(panoramas, positions, focal_lengths):
+    """Create cameras with individual focal lengths"""
+    cameras = []
+    esp_ids = []
+
+    sorted_esps = sorted([(esp_id, pos) for esp_id, pos in positions.items()
+                         if esp_id in panoramas], key=lambda x: x[1])
+
+    print("Creating cameras with custom focal lengths:")
+    for esp_id, angle_deg in sorted_esps:
+        esp_ids.append(esp_id)
+
+        # Get custom focal length or default
+        focal = focal_lengths.get(esp_id, 1000)
+
+        # Rotation matrix (Y-axis rotation)
+        angle_rad = np.radians(angle_deg)
+        cos_a, sin_a = np.cos(-angle_rad), np.sin(-angle_rad)
+        R = np.array([[cos_a, 0, sin_a],
+                      [0, 1, 0],
+                      [-sin_a, 0, cos_a]], dtype=np.float32)
+
+        # Image size → principal point
+        h, w = panoramas[esp_id].shape[:2]
+
+        # Construct OpenCV CameraParams
+        cam = cv.detail_CameraParams()
+        cam.focal = focal
+        cam.aspect = 1.0
+        cam.ppx = w / 2.0
+        cam.ppy = h / 2.0
+        cam.R = R
+        cam.t = np.zeros((3, 1), np.float32)  # no translation
+
+        cameras.append(cam)
+
+        direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(angle_deg, f"{angle_deg}°")
+        print(f"  ESP {esp_id} ({direction}, {angle_deg}°): focal={cam.focal}")
+
+    return cameras, esp_ids
+
+# Uncomment to test with custom focal lengths:
+# custom_focal_cameras, custom_focal_esp_ids = create_position_based_cameras_with_custom_focals(
+#     esp_panoramas, ESP_POSITIONS, ESP_FOCAL_LENGTHS)
 
 # %%
