@@ -726,14 +726,13 @@ print(f"Pure position-based panorama saved: {pure_output_path}")
 
 # %%
 def create_custom_position_cameras(panoramas: Dict[str, np.ndarray], 
-                                 custom_positions: Dict[str, Tuple[float, float, float]],
-                                 base_focal: float = 1000) -> List[Camera]:
+                                 custom_positions: Dict[str, Tuple[float, float, float]]) -> List[Camera]:
     """Create cameras with custom pan, tilt, roll adjustments"""
     cameras = []
     esp_ids = []
     
     print(f"Creating custom position cameras:")
-    for esp_id, (pan, tilt, roll) in custom_positions.items():
+    for esp_id, (pan, tilt, roll, focal) in custom_positions.items():
         if esp_id not in panoramas:
             continue
             
@@ -768,7 +767,7 @@ def create_custom_position_cameras(panoramas: Dict[str, np.ndarray],
         
         # Construct OpenCV CameraParams
         cam = cv.detail_CameraParams()
-        cam.focal = base_focal
+        cam.focal = focal
         cam.aspect = 1.0
         cam.ppx = w / 2.0
         cam.ppy = h / 2.0
@@ -783,10 +782,10 @@ def create_custom_position_cameras(panoramas: Dict[str, np.ndarray],
 # Example: Fine adjustments to the base positions
 # You can modify these values if the initial result needs tweaking
 CUSTOM_POSITIONS = {
-    'esp_2': (0, 0, 0),      # Front: pan=0°, tilt=0°, roll=0°
-    'esp_3': (80, 0, 0),     # Left: pan=90°, tilt=0°, roll=0°
-    'esp_4': (165, 0, 0),     # Back: pan=180°, tilt=0°, roll=0°
-    'esp_1': (270, 0, 0)    # Right: pan=270°, tilt=0°, roll=0° 
+    'esp_2': (0, 0, 0, 250),      # Front: pan=0°, tilt=0°, roll=0°, focal = 250
+    'esp_3': (80, 0, 0, 220),     # Left: pan=90°, tilt=0°, roll=0°, focal = 250
+    'esp_4': (165, 0, 0, 220),     # Back: pan=180°, tilt=0°, roll=0°, focal = 250
+    'esp_1': (270, 0, 0, 250)    # Right: pan=270°, tilt=0°, roll=0°, focal = 250
 }
 
 # Uncomment to try custom positions:
@@ -832,8 +831,7 @@ class Camera:
         ], dtype=np.float32)
 
 def stitch_with_position_based_cameras(panoramas: Dict[str, np.ndarray],
-                                     high_mpix: float = 1.2,
-                                     try_fine_tune: bool = True) -> np.ndarray:
+                                     high_mpix: float = 1.2) -> np.ndarray:
     """Stitch ESP panoramas using known positions with optional fine-tuning"""
     print(f"\n{'='*60}")
     print(f"STAGE 2: Position-based stitching of {len(panoramas)} ESP panoramas")
@@ -843,7 +841,7 @@ def stitch_with_position_based_cameras(panoramas: Dict[str, np.ndarray],
         return list(panoramas.values())[0]
     
     # Create custom-position-based cameras
-    cameras, esp_ids = create_custom_position_cameras(esp_panoramas, CUSTOM_POSITIONS, 250)
+    cameras, esp_ids = create_custom_position_cameras(esp_panoramas, CUSTOM_POSITIONS)
     
     # Prepare images at high resolution
     imgs = []
@@ -916,8 +914,7 @@ def stitch_with_position_based_cameras(panoramas: Dict[str, np.ndarray],
 print("Starting Stage 2: Custom Position-based inter-ESP stitching...")
 final_panorama = stitch_with_position_based_cameras(
     esp_panoramas,
-    HIGH_MPIX,
-    try_fine_tune=False  # Set to False to skip fine-tuning
+    HIGH_MPIX
 )
 
 # Show final result
@@ -928,6 +925,304 @@ final_output_path = "final_custom_position_based_panorama.jpg"
 cv.imwrite(final_output_path, final_panorama)
 print(f"\nFinal panorama saved: {final_output_path}")
 print(f"Final size: {final_panorama.shape[1]}x{final_panorama.shape[0]}")
+
+# %% [markdown]
+# # Map anchor images to final panorama
+
+# %% [markdown]
+# ## Load reference panorama and anchor images
+
+
+# %%
+# Load the reference panorama
+reference_panorama_path = "final_custom_position_based_panorama.jpg"
+reference_panorama = cv.imread(reference_panorama_path, cv.IMREAD_COLOR)
+if reference_panorama is None:
+    print(f"Could not load reference panorama from {reference_panorama_path}")
+    # Fall back to the final stitched panorama we created
+    reference_panorama = final_panorama
+else:
+    print(f"Loaded reference panorama: {reference_panorama.shape[1]}x{reference_panorama.shape[0]}")
+
+plot_image(reference_panorama, figsize=(15, 8), title="Reference Panorama")
+
+# Load the 4 anchor images
+anchor_dir = "final/data/anchors"
+anchor_images = {}
+anchor_paths = {}
+
+for i in range(1, 5):
+    anchor_path = f"{anchor_dir}/anchor_esp_{i}.jpg"
+    anchor_img = cv.imread(anchor_path, cv.IMREAD_COLOR)
+    if anchor_img is not None:
+        anchor_images[f"esp_{i}"] = anchor_img
+        anchor_paths[f"esp_{i}"] = anchor_path
+        print(f"Loaded anchor ESP {i}: {anchor_img.shape[1]}x{anchor_img.shape[0]}")
+    else:
+        print(f"Failed to load anchor ESP {i} from {anchor_path}")
+
+# Display anchor images
+anchor_display_images = []
+anchor_display_titles = []
+for esp_id in sorted(anchor_images.keys()):
+    anchor_display_images.append(anchor_images[esp_id])
+    position = ESP_POSITIONS.get(esp_id, "unknown")
+    direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(position, f"{position}°")
+    anchor_display_titles.append(f"Anchor {esp_id}\n({direction})")
+
+plot_images(anchor_display_images, titles=anchor_display_titles, figsize=(20, 8))
+
+# %% [markdown]
+# ## Compute homographies from anchors to reference panorama
+
+# %%
+def compute_homography_to_reference(anchor_img, reference_img, detector_type="orb", n_features=3000):
+    """Compute homography from anchor image to reference panorama using feature matching"""
+
+    # Create detector
+    if detector_type.lower() == "orb":
+        detector = cv.ORB_create(nfeatures=n_features)
+        norm = cv.NORM_HAMMING
+    elif detector_type.lower() == "sift":
+        detector = cv.SIFT_create(nfeatures=n_features)
+        norm = cv.NORM_L2
+    else:
+        detector = cv.ORB_create(nfeatures=n_features)
+        norm = cv.NORM_HAMMING
+
+    # Detect features in both images
+    kp1, desc1 = detector.detectAndCompute(anchor_img, None)
+    kp2, desc2 = detector.detectAndCompute(reference_img, None)
+
+    if desc1 is None or desc2 is None or len(kp1) < 4 or len(kp2) < 4:
+        print("Not enough features detected")
+        return None, [], []
+
+    # Handle UMat objects
+    if hasattr(desc1, 'get'):
+        desc1 = desc1.get()
+    if hasattr(desc2, 'get'):
+        desc2 = desc2.get()
+
+    # Ensure descriptors are numpy arrays
+    if not isinstance(desc1, np.ndarray):
+        desc1 = np.array(desc1)
+    if not isinstance(desc2, np.ndarray):
+        desc2 = np.array(desc2)
+
+    if desc1.shape[0] == 0 or desc2.shape[0] == 0:
+        print("No descriptors found")
+        return None, [], []
+
+    # Match descriptors
+    bf = cv.BFMatcher(norm, crossCheck=False)
+    matches = bf.knnMatch(desc1, desc2, k=2)
+
+    # Apply ratio test
+    good_matches = []
+    for m, n in matches:
+        if m.distance < 0.75 * n.distance:
+            good_matches.append(m)
+
+    print(f"Found {len(good_matches)} good matches out of {len(matches)} total matches")
+
+    if len(good_matches) < 4:
+        print("Not enough good matches for homography")
+        return None, kp1, kp2
+
+    # Extract matched keypoints
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+    # Compute homography
+    H, mask = cv.findHomography(src_pts, dst_pts, cv.RANSAC, 5.0)
+
+    if H is None:
+        print("Homography computation failed")
+        return None, kp1, kp2
+
+    # Filter matches using the mask
+    inlier_matches = [good_matches[i] for i in range(len(good_matches)) if mask[i]]
+
+    print(f"Homography computed with {len(inlier_matches)} inliers")
+
+    return H, kp1, kp2
+
+# Compute homographies for each anchor to reference
+anchor_homographies = {}
+
+for esp_id, anchor_img in anchor_images.items():
+    print(f"\nComputing homography for {esp_id}...")
+    H, kp1, kp2 = compute_homography_to_reference(anchor_img, reference_panorama, "orb", 3000)
+    if H is not None:
+        anchor_homographies[esp_id] = H
+        print(f"  Homography shape: {H.shape}")
+    else:
+        print(f"  Failed to compute homography for {esp_id}")
+
+print(f"\nSuccessfully computed homographies for {len(anchor_homographies)}/{len(anchor_images)} anchors")
+
+# %% [markdown]
+# ## Visualize feature matches for each anchor to reference
+
+# %%
+def draw_matches_to_reference(anchor_img, reference_img, kp1, kp2, matches, title="", max_matches=50):
+    """Draw feature matches between anchor and reference images"""
+    # Create a combined image (reference on left, anchor on right for better viewing)
+    h_ref, w_ref = reference_img.shape[:2]
+    h_anchor, w_anchor = anchor_img.shape[:2]
+
+    # Create canvas
+    canvas = np.zeros((max(h_ref, h_anchor), w_ref + w_anchor, 3), dtype=np.uint8)
+
+    # Place images side by side
+    canvas[:h_ref, :w_ref] = reference_img
+    canvas[:h_anchor, w_ref:w_ref+w_anchor] = anchor_img
+
+    # Draw lines connecting matched features (limit for clarity)
+    display_matches = matches[:max_matches]
+
+    for match in display_matches:
+        # Get keypoint coordinates
+        pt_ref = (int(kp2[match.trainIdx].pt[0]), int(kp2[match.trainIdx].pt[1]))
+        pt_anchor = (int(kp1[match.queryIdx].pt[0] + w_ref), int(kp1[match.queryIdx].pt[1]))
+
+        # Draw line connecting the points
+        cv.line(canvas, pt_ref, pt_anchor, (255, 0, 0), 1)  # Blue line
+
+        # Draw circles at feature points
+        cv.circle(canvas, pt_ref, 3, (0, 255, 0), -1)  # Green circle on reference
+        cv.circle(canvas, pt_anchor, 3, (0, 0, 255), -1)  # Red circle on anchor
+
+    plt.figure(figsize=(18, 10))
+    plt.imshow(cv.cvtColor(canvas, cv.COLOR_BGR2RGB))
+    plt.title(f"{title} ({len(display_matches)}/{len(matches)} matches shown)")
+    plt.axis('off')
+    plt.show()
+
+# Visualize matches for each anchor (we need to recompute to get keypoints)
+for esp_id, anchor_img in anchor_images.items():
+    print(f"\nVisualizing matches for {esp_id}...")
+    H, kp_anchor, kp_ref = compute_homography_to_reference(anchor_img, reference_panorama, "orb", 3000)
+
+    if H is not None:
+        # Get good matches again for visualization
+        detector = cv.ORB_create(nfeatures=3000)
+        kp1, desc1 = detector.detectAndCompute(anchor_img, None)
+        kp2, desc2 = detector.detectAndCompute(reference_panorama, None)
+
+        bf = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=False)
+        matches = bf.knnMatch(desc1, desc2, k=2)
+
+        good_matches = []
+        for m, n in matches:
+            if m.distance < 0.75 * n.distance:
+                good_matches.append(m)
+
+        position = ESP_POSITIONS.get(esp_id, "unknown")
+        direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(position, f"{position}°")
+        title = f"Feature Matches: Anchor {esp_id} ({direction}) → Reference Panorama"
+        draw_matches_to_reference(anchor_img, reference_panorama, kp1, kp2, good_matches, title)
+    else:
+        print(f"Skipping visualization for {esp_id} (no homography)")
+
+# %% [markdown]
+# ## Create anchor panorama using homography warping
+
+# %%
+def create_anchor_panorama_from_homographies(anchor_images: Dict[str, np.ndarray],
+                                           anchor_homographies: Dict[str, np.ndarray],
+                                           reference_panorama: np.ndarray) -> np.ndarray:
+    """Create anchor panorama by warping anchors using their homographies to reference space"""
+    print("Creating anchor panorama using homography warping...")
+
+    if not anchor_homographies:
+        print("No homographies available, cannot create anchor panorama")
+        return None
+
+    # Use reference panorama dimensions as canvas size
+    canvas_height, canvas_width = reference_panorama.shape[:2]
+    canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+
+    print(f"Canvas size: {canvas_width}x{canvas_height}")
+
+    # Warp each anchor to the canvas using its homography
+    for esp_id, homography in anchor_homographies.items():
+        if esp_id not in anchor_images:
+            print(f"Warning: No anchor image for {esp_id}, skipping")
+            continue
+
+        anchor_img = anchor_images[esp_id]
+        print(f"Warping {esp_id} using homography...")
+
+        # Warp the anchor image to the canvas coordinate system
+        warped_anchor = cv.warpPerspective(anchor_img, homography,
+                                         (canvas_width, canvas_height),
+                                         flags=cv.INTER_LINEAR,
+                                         borderMode=cv.BORDER_TRANSPARENT)
+
+        # Create mask for non-transparent pixels
+        mask = (warped_anchor.sum(axis=2) > 0)
+
+        # Composite onto canvas
+        canvas[mask] = warped_anchor[mask]
+
+        print(f"  {esp_id}: warped and composited")
+
+    return canvas
+
+# Create the anchor panorama using homography warping
+anchor_panorama = create_anchor_panorama_from_homographies(
+    anchor_images,      # Anchor images
+    anchor_homographies, # Homographies from anchors to reference
+    reference_panorama   # Reference panorama for canvas size
+)
+
+# Display the result
+plot_image(anchor_panorama, figsize=(15, 8), title="Anchor Panorama (Spherical Warping with Known Positions)")
+
+# Save the anchor panorama
+anchor_panorama_path = "anchor_panorama.jpg"
+cv.imwrite(anchor_panorama_path, anchor_panorama)
+print(f"Saved anchor panorama: {anchor_panorama_path}")
+print(f"Anchor panorama size: {anchor_panorama.shape[1]}x{anchor_panorama.shape[0]}")
+
+# %% [markdown]
+# ## Save homographies for later use
+
+# %%
+# Save the homographies as a numpy array
+if anchor_homographies:
+    # Convert to a dict that can be saved
+    homographies_dict = {}
+    for esp_id, H in anchor_homographies.items():
+        homographies_dict[esp_id] = H
+
+    # Save as numpy file
+    homographies_path = "anchor_homographies.npy"
+    np.save(homographies_path, homographies_dict)
+    print(f"Saved homographies to {homographies_path}")
+
+    # Also save as pickle for easier loading
+    import pickle
+    with open("anchor_homographies.pkl", "wb") as f:
+        pickle.dump(homographies_dict, f)
+    print("Saved homographies as pickle file")
+
+    # Print homography summary
+    print("\nHomography Summary:")
+    for esp_id, H in anchor_homographies.items():
+        print(f"  {esp_id}: {H.shape} matrix")
+        print(f"    Translation: [{H[0,2]:.1f}, {H[1,2]:.1f}]")
+        print(f"    Scale: approx {np.sqrt(H[0,0]**2 + H[1,0]**2):.3f}")
+else:
+    print("No homographies to save")
+
+print("\nAnchor mapping to reference panorama completed!")
+print("Homographies saved for quick application to new images in the next cell.")
+
+# %% [markdown]
+# # Testing auto fine tuning ESP angles
 
 # %% [markdown]
 # ## Cell 1: Show the 4 current stitched ESP images side by side
@@ -951,7 +1246,7 @@ plot_images(esp_images, titles=esp_titles, figsize=(20, 8))
 def detect_and_visualize_features(img, title="", n_features=5000):
     """Detect ORB features and return image with features drawn"""
     # Create ORB detector
-    orb = cv.ORB_create(nfeatures=n_features)
+    orb = cv.SIFT_create(nfeatures=n_features)
 
     # Detect keypoints
     keypoints, descriptors = orb.detectAndCompute(img, None)
@@ -961,7 +1256,7 @@ def detect_and_visualize_features(img, title="", n_features=5000):
                                         color=(0, 255, 0),  # Green color
                                         flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
 
-    print(f"{title}: {len(keypoints)} ORB features detected")
+    print(f"{title}: {len(keypoints)} SIFT features detected")
     return img_with_keypoints, keypoints, descriptors
 
 # Detect features in all 4 ESP panoramas
@@ -1209,70 +1504,3 @@ print("\nOptimized ESP positions:")
 for esp_id, angle in optimized_positions.items():
     direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(angle, f"{angle}°")
     print(f"  ESP {esp_id}: {angle:.1f}° ({direction})")
-
-# %% [markdown]
-# ## Optional: Individual ESP focal length settings
-
-# %%
-# Individual focal lengths for each ESP (can be tuned separately)
-ESP_FOCAL_LENGTHS = {
-    'esp_2': 250,   # Front
-    'esp_3': 250,   # Left
-    'esp_1': 250,   # Right
-    'esp_4': 250    # Back
-}
-
-print("Individual ESP focal length settings:")
-print("(Modify these values to fine-tune each camera's focal length)")
-for esp_id, focal in ESP_FOCAL_LENGTHS.items():
-    position = ESP_POSITIONS.get(esp_id, "unknown")
-    direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(position, f"{position}°")
-    print(f"  ESP {esp_id} ({direction}): focal = {focal}")
-
-# Example of how to use custom focal lengths in camera creation
-def create_position_based_cameras_with_custom_focals(panoramas, positions, focal_lengths):
-    """Create cameras with individual focal lengths"""
-    cameras = []
-    esp_ids = []
-
-    sorted_esps = sorted([(esp_id, pos) for esp_id, pos in positions.items()
-                         if esp_id in panoramas], key=lambda x: x[1])
-
-    print("Creating cameras with custom focal lengths:")
-    for esp_id, angle_deg in sorted_esps:
-        esp_ids.append(esp_id)
-
-        # Get custom focal length or default
-        focal = focal_lengths.get(esp_id, 1000)
-
-        # Rotation matrix (Y-axis rotation)
-        angle_rad = np.radians(angle_deg)
-        cos_a, sin_a = np.cos(-angle_rad), np.sin(-angle_rad)
-        R = np.array([[cos_a, 0, sin_a],
-                      [0, 1, 0],
-                      [-sin_a, 0, cos_a]], dtype=np.float32)
-
-        # Image size → principal point
-        h, w = panoramas[esp_id].shape[:2]
-
-        # Construct OpenCV CameraParams
-        cam = cv.detail_CameraParams()
-        cam.focal = focal
-        cam.aspect = 1.0
-        cam.ppx = w / 2.0
-        cam.ppy = h / 2.0
-        cam.R = R
-        cam.t = np.zeros((3, 1), np.float32)  # no translation
-
-        cameras.append(cam)
-
-        direction = {0: "Front", 90: "Left", 180: "Back", 270: "Right"}.get(angle_deg, f"{angle_deg}°")
-        print(f"  ESP {esp_id} ({direction}, {angle_deg}°): focal={cam.focal}")
-
-    return cameras, esp_ids
-
-# Uncomment to test with custom focal lengths:
-# custom_focal_cameras, custom_focal_esp_ids = create_position_based_cameras_with_custom_focals(
-#     esp_panoramas, ESP_POSITIONS, ESP_FOCAL_LENGTHS)
-
-# %%
